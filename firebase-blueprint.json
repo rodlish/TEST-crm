@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "Candidate": {
+      "title": "Candidate",
+      "description": "Represents a person taking recruitment tests.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "password": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed"] },
+        "assignedModules": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "currentModuleId": { "type": "string" }
+      },
+      "required": ["id", "name", "email", "status"]
+    },
+    "TestType": {
+      "title": "TestType",
+      "description": "A template for a pack of tests.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "moduleTemplates": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["id", "name"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Represents a user with administrative privileges.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/candidates/{candidateId}": {
+      "schema": "Candidate",
+      "description": "Collection of candidate records and their test progress."
+    },
+    "/testTypes/{testTypeId}": {
+      "schema": "TestType",
+      "description": "Templates for different types of test packs."
+    },
+    "/admins/{adminId}": {
+      "schema": "Admin",
+      "description": "Registry of authorized admin users."
+    }
+  }
+}

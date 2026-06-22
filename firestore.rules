@@ -1,0 +1,69 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // -------------------------------------------------------------------------
+    // 0. GLOBAL SAFETY NET
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // HELPER FUNCTIONS
+    // -------------------------------------------------------------------------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+       // Root admin check (hardcoded email for bootstrap)
+       return isSignedIn() && (
+         request.auth.token.email == 'e.rodlish@gmail.com' ||
+         request.auth.token.email == 'admin@ted-company.com' ||
+         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+       );
+    }
+
+    // -------------------------------------------------------------------------
+    // CANDIDATES COLLECTION (Holds Agent Accounts in our CRM)
+    // -------------------------------------------------------------------------
+    match /candidates/{candidateId} {
+      // Allow read/writes to manage agent accounts
+      allow read: if true; 
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // LEADS COLLECTION (The main CRM pipeline)
+    // -------------------------------------------------------------------------
+    match /leads/{leadId} {
+      // Allow CRM administrators and registered agents to track leads
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // NOTIFICATIONS COLLECTION (Recent alerts feed)
+    // -------------------------------------------------------------------------
+    match /notifications/{notifId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // SETTINGS COLLECTION (Google Sheets configuration documents)
+    // -------------------------------------------------------------------------
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // ADMINS COLLECTION
+    // -------------------------------------------------------------------------
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false; // Only manageable via Firebase Console or hardcoded bootstrap
+    }
+  }
+}

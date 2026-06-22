@@ -1,0 +1,10 @@
+{
+  "name": "crm.ted-company",
+  "description": "Portail de CRM pour TED-Company Group.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
