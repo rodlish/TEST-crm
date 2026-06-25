@@ -39,21 +39,39 @@ import {
   CheckCheck,
   Eye,
   FileSpreadsheet,
-  Building
+  Building,
+  SlidersHorizontal
 } from 'lucide-react';
 import { GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { auth } from '../lib/firebase';
-import { Lead, AgentAccount, LeadStatus, LeadTemperature, SystemNotification, CRMConfig, LeadHistoryEvent, LeadFeedbackStatus } from '../types';
+import { 
+  ResponsiveContainer, 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  Legend, 
+  PieChart, 
+  Pie, 
+  Cell 
+} from 'recharts';
+import { Lead, AgentAccount, LeadStatus, LeadTemperature, SystemNotification, CRMConfig, LeadHistoryEvent, LeadFeedbackStatus, User, Team, UserRole } from '../types';
 import { FEEDBACK_LABELS } from './TestPlatform';
 import { findCRMSpreadsheet, createCRMSpreadsheet, pushCRMDataToSheet, pullCRMDataFromSheet } from '../lib/googleSheets';
 import { GOOGLE_APPS_SCRIPT_TEMPLATE, triggerAppsScriptEvent } from '../lib/googleAppsScript';
 
 interface AdminDashboardProps {
+  currentUser?: User;
   leads: Lead[];
   agents: AgentAccount[];
+  teams?: Team[];
   notifications: SystemNotification[];
   sheetConfig: CRMConfig;
   lastSync: Date | null;
+  onlineUsers?: any[];
+  presenceLogs?: any[];
   onLogout: () => void;
   onAddLead: (lead: Lead) => void;
   onDeleteLead: (id: string) => void;
@@ -61,6 +79,9 @@ interface AdminDashboardProps {
   onAddAgent: (agent: AgentAccount) => void;
   onDeleteAgent: (id: string) => void;
   onUpdateAgent: (agent: AgentAccount) => void;
+  onAddTeam?: (team: Team) => void;
+  onUpdateTeam?: (team: Team) => void;
+  onDeleteTeam?: (id: string) => void;
   onUpdateSheetConfig: (config: CRMConfig) => void;
   onMarkNotificationRead: (id: string) => void;
   onClearNotifications: () => void;
@@ -68,11 +89,15 @@ interface AdminDashboardProps {
 }
 
 export default function AdminDashboard({ 
-  leads, 
-  agents,
+  currentUser,
+  leads: rawLeads, 
+  agents: rawAgents,
+  teams = [],
   notifications,
   sheetConfig,
   lastSync,
+  onlineUsers: rawOnlineUsers = [],
+  presenceLogs: rawPresenceLogs = [],
   onLogout, 
   onAddLead,
   onDeleteLead,
@@ -80,6 +105,9 @@ export default function AdminDashboard({
   onAddAgent, 
   onDeleteAgent, 
   onUpdateAgent,
+  onAddTeam,
+  onUpdateTeam,
+  onDeleteTeam,
   onUpdateSheetConfig,
   onMarkNotificationRead,
   onClearNotifications,
@@ -107,10 +135,79 @@ export default function AdminDashboard({
     }
   };
 
-  const [activeTab, setActiveTab] = useState<'leads' | 'agents' | 'sheets' | 'notifications'>('leads');
+  // Role-based dynamic data filtering
+  const userEmail = currentUser?.email?.toLowerCase().trim() || '';
+
+  const filteredTeamsForRole = teams.filter(t => {
+    if (currentUser?.role === 'admin') return true;
+    if (currentUser?.role === 'supervisor') {
+      return t.supervisorId === userEmail || 
+             t.supervisorId?.toLowerCase().trim() === userEmail ||
+             (t.supervisorIds && t.supervisorIds.some(email => email.toLowerCase().trim() === userEmail));
+    }
+    if (currentUser?.role === 'manager') {
+      const hasManagerAssignments = teams.some(team => team.managerIds && team.managerIds.some(email => email.toLowerCase().trim() === userEmail));
+      if (hasManagerAssignments) {
+        return t.managerIds && t.managerIds.some(email => email.toLowerCase().trim() === userEmail);
+      }
+      return true;
+    }
+    return true;
+  });
+
+  const filteredTeamNames = filteredTeamsForRole.map(t => t.name);
+
+  const agents = (currentUser?.role === 'supervisor' || currentUser?.role === 'manager')
+    ? rawAgents.filter(a => 
+        a.email.toLowerCase().trim() === userEmail || 
+        (a.team && filteredTeamNames.includes(a.team)) ||
+        (a.role === 'supervisor' && teams.some(t => filteredTeamNames.includes(t.name) && (t.supervisorId === a.email || (t.supervisorIds && t.supervisorIds.includes(a.email)))))
+      )
+    : rawAgents;
+
+  const agentIds = agents.map(a => a.id);
+
+  const leads = (currentUser?.role === 'supervisor' || currentUser?.role === 'manager')
+    ? rawLeads.filter(l => l.assignedAgentId && agentIds.includes(l.assignedAgentId))
+    : rawLeads;
+
+  const presenceLogs = (currentUser?.role === 'supervisor' || currentUser?.role === 'manager')
+    ? rawPresenceLogs.filter(log => agents.some(a => a.email.toLowerCase().trim() === log.email.toLowerCase().trim()))
+    : rawPresenceLogs;
+
+  const onlineUsers = (currentUser?.role === 'supervisor' || currentUser?.role === 'manager')
+    ? rawOnlineUsers.filter(u => agents.some(a => a.email.toLowerCase().trim() === u.email.toLowerCase().trim()))
+    : rawOnlineUsers;
+
+  const filteredAdvisors = agents.filter(a => !a.role || a.role === 'agent');
+  const filteredSupervisors = rawAgents.filter(a => a.role === 'supervisor');
+  const filteredManagers = rawAgents.filter(a => a.role === 'manager');
+
+  const [activeTab, setActiveTab] = useState<'leads' | 'agents' | 'sheets' | 'notifications' | 'presence' | 'performance'>(
+    (currentUser?.role === 'manager' || currentUser?.role === 'supervisor') ? 'performance' : 'leads'
+  );
+  const activeUsers = (onlineUsers || []).filter(u => {
+    if (!u.lastActive) return false;
+    const lastActiveTime = new Date(u.lastActive).getTime();
+    const now = new Date().getTime();
+    return now - lastActiveTime < 90000;
+  });
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<LeadStatus | 'all'>('all');
   const [agentFilter, setAgentFilter] = useState<string>('all');
+  const [presenceAgentFilter, setPresenceAgentFilter] = useState<string>('all');
+  const [presenceStatusFilter, setPresenceStatusFilter] = useState<string>('all');
+  const [presenceTimeframe, setPresenceTimeframe] = useState<'all' | 'dayOfWeek' | 'date' | 'month'>('all');
+  const [presenceDayOfWeek, setPresenceDayOfWeek] = useState<string>('all');
+  const [presenceDate, setPresenceDate] = useState<string>('');
+  const [presenceMonth, setPresenceMonth] = useState<string>('');
+
+  const [perfAgentFilter, setPerfAgentFilter] = useState<string>('all');
+  const [perfTeamFilter, setPerfTeamFilter] = useState<string>('all');
+  const [perfTimeframe, setPerfTimeframe] = useState<'all' | 'dayOfWeek' | 'date' | 'month'>('all');
+  const [perfDayOfWeek, setPerfDayOfWeek] = useState<string>('all');
+  const [perfDate, setPerfDate] = useState<string>('');
+  const [perfMonth, setPerfMonth] = useState<string>('');
   const [googleToken, setGoogleToken] = useState<string | null>(() => {
     return localStorage.getItem('google_oauth_token') || null;
   });
@@ -130,9 +227,24 @@ export default function AdminDashboard({
   const [showLeadDetailsModal, setShowLeadDetailsModal] = useState(false);
   const [showAddAgentModal, setShowAddAgentModal] = useState(false);
   const [showEditAgentModal, setShowEditAgentModal] = useState(false);
+  const [showAddTeamModal, setShowAddTeamModal] = useState(false);
+  const [showEditTeamModal, setShowEditTeamModal] = useState(false);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<AgentAccount | null>(null);
+  const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
   const [isEditingCorporate, setIsEditingCorporate] = useState(false);
+  const [agentsSubTab, setAgentsSubTab] = useState<'agents' | 'supervisors' | 'managers' | 'teams'>('agents');
+  const [newTeam, setNewTeam] = useState<{
+    name: string;
+    supervisorId: string;
+    supervisorIds: string[];
+    managerIds: string[];
+  }>({
+    name: '',
+    supervisorId: '',
+    supervisorIds: [],
+    managerIds: []
+  });
 
   // New Lead Form State
   const [newLead, setNewLead] = useState({
@@ -177,7 +289,9 @@ export default function AdminDashboard({
     name: '',
     email: '',
     password: '',
-    isActive: true
+    isActive: true,
+    team: '',
+    role: 'agent' as UserRole
   });
 
   // Hot/Warm/Cold theme colors
@@ -269,7 +383,7 @@ export default function AdminDashboard({
 
     setSyncStatus({ type: 'loading', message: 'Écriture et mise à jour des pistes...' });
     try {
-      const success = await pushCRMDataToSheet(token, sheetId, leads, agents);
+      const success = await pushCRMDataToSheet(token, sheetId, leads, agents, onlineUsers, presenceLogs);
       if (success) {
         onUpdateSheetConfig({ ...sheetConfig, lastSyncedAt: new Date().toISOString() });
         setSyncStatus({ type: 'success', message: `Exportation de ${leads.length} pistes et de ${agents.length} conseillers réussie !` });
@@ -533,11 +647,13 @@ export default function AdminDashboard({
       name: newAgent.name,
       email: newAgent.email.toLowerCase().trim(),
       password: newAgent.password,
-      isActive: newAgent.isActive
+      isActive: newAgent.isActive,
+      team: newAgent.team.trim() || 'Sans Équipe',
+      role: newAgent.role || 'agent'
     };
 
     onAddAgent(agent);
-    setNewAgent({ name: '', email: '', password: '', isActive: true });
+    setNewAgent({ name: '', email: '', password: '', isActive: true, team: '', role: 'agent' });
     setShowAddAgentModal(false);
   };
 
@@ -555,6 +671,40 @@ export default function AdminDashboard({
       ...agent,
       isActive: !agent.isActive
     });
+  };
+
+  // Team CRUD handlers
+  const handleCreateTeam = (e: FormEvent) => {
+    e.preventDefault();
+    if (!newTeam.name.trim()) return;
+
+    const teamId = `team_${Math.random().toString(36).substr(2, 9)}`;
+    const teamObj: Team = {
+      id: teamId,
+      name: newTeam.name.trim(),
+      supervisorId: newTeam.supervisorId || (newTeam.supervisorIds?.[0] || ''),
+      supervisorIds: newTeam.supervisorIds || [],
+      managerIds: newTeam.managerIds || [],
+      createdAt: new Date().toISOString()
+    };
+
+    onAddTeam?.(teamObj);
+    setNewTeam({ name: '', supervisorId: '', supervisorIds: [], managerIds: [] });
+    setShowAddTeamModal(false);
+  };
+
+  const handleEditTeamSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    if (selectedTeam && selectedTeam.name.trim()) {
+      onUpdateTeam?.({
+        ...selectedTeam,
+        supervisorId: selectedTeam.supervisorId || (selectedTeam.supervisorIds?.[0] || ''),
+        supervisorIds: selectedTeam.supervisorIds || [],
+        managerIds: selectedTeam.managerIds || []
+      });
+      setShowEditTeamModal(false);
+      setSelectedTeam(null);
+    }
   };
 
   // Filtering leads
@@ -598,14 +748,20 @@ export default function AdminDashboard({
       )}
 
       {/* Sidebar */}
-      <aside className="w-full md:w-64 bg-brand-primary text-white p-6 md:sticky md:top-0 md:h-screen flex flex-col">
+      <aside className="w-full md:w-64 bg-brand-primary text-white p-6 md:sticky md:top-0 md:h-screen flex flex-col overflow-y-auto custom-scrollbar">
         <div className="flex items-center gap-3 mb-12">
           <img 
             src="https://www.ted-companygroup.com/assets%20ancien/img/logos/ted-company-with-letter.png" 
             alt="Logo" 
             className="h-8 brightness-0 invert"
           />
-          <span className="font-bold tracking-tight text-lg">CRM Administrateur</span>
+          <span className="font-bold tracking-tight text-lg">
+            {currentUser?.role === 'admin' 
+              ? 'CRM Administrateur' 
+              : currentUser?.role === 'manager' 
+                ? 'Suivi Manager' 
+                : 'Suivi Superviseur'}
+          </span>
         </div>
 
         <nav className="space-y-2 flex-1">
@@ -631,20 +787,48 @@ export default function AdminDashboard({
             <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded font-black">{agents.length}</span>
           </button>
 
+          {currentUser?.role !== 'supervisor' && (
+            <button 
+              onClick={() => setActiveTab('sheets')}
+              className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all font-semibold ${activeTab === 'sheets' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
+            >
+              <span className="flex items-center gap-3">
+                <Database size={18} />
+                Google Sheets Sync
+              </span>
+              {sheetConfig.spreadsheetId ? (
+                <span className="flex h-2 w-2 relative">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                </span>
+              ) : null}
+            </button>
+          )}
+
           <button 
-            onClick={() => setActiveTab('sheets')}
-            className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all font-semibold ${activeTab === 'sheets' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
+            onClick={() => setActiveTab('presence')}
+            className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all font-semibold ${activeTab === 'presence' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
           >
             <span className="flex items-center gap-3">
-              <Database size={18} />
-              Google Sheets Sync
+              <Clock size={18} />
+              Suivi Présence
             </span>
-            {sheetConfig.spreadsheetId ? (
-              <span className="flex h-2 w-2 relative">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-              </span>
-            ) : null}
+            <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded font-black">
+              {onlineUsers.filter(u => u.status === 'en_ligne').length} Actifs
+            </span>
+          </button>
+
+          <button 
+            onClick={() => setActiveTab('performance')}
+            className={`w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all font-semibold ${activeTab === 'performance' ? 'bg-blue-600 text-white' : 'text-slate-300 hover:bg-white/10'}`}
+          >
+            <span className="flex items-center gap-3">
+              <Award size={18} />
+              Performance & KPIs
+            </span>
+            <span className="text-[10px] bg-blue-500/20 text-blue-400 px-1.5 py-0.5 rounded font-black">
+              Stats
+            </span>
           </button>
 
           <button 
@@ -685,16 +869,57 @@ export default function AdminDashboard({
           </div>
         )}
 
-        <div className="mt-auto pt-8 border-t border-white/10">
+        {/* Active Connections Presence List */}
+        <div className="mt-4 pt-4 border-t border-white/10 flex-1 overflow-y-auto custom-scrollbar space-y-3 min-h-[140px] max-h-[220px]">
+          <div className="flex items-center justify-between">
+            <label className="text-[9px] uppercase font-bold text-slate-400 tracking-wider block">Actifs sur le CRM</label>
+            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-black bg-emerald-500/20 text-emerald-400 gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              {activeUsers.length} en ligne
+            </span>
+          </div>
+          <div className="space-y-2">
+            {activeUsers.map((u) => (
+              <div key={u.email} className="flex items-center gap-2.5 text-xs text-slate-200">
+                <div className="relative shrink-0">
+                  <div className="w-7 h-7 rounded-full bg-blue-500/20 border border-blue-400/20 flex items-center justify-center text-[10px] font-black uppercase text-blue-300">
+                    {u.name ? u.name.substring(0, 2) : '??'}
+                  </div>
+                  <span className="absolute bottom-0 right-0 block h-2 w-2 rounded-full bg-emerald-400 ring-2 ring-slate-800" />
+                </div>
+                <div className="overflow-hidden">
+                  <p className="font-semibold truncate">{u.name || u.email}</p>
+                  <p className="text-[9px] text-slate-400 uppercase tracking-widest font-bold">
+                    {u.role === 'admin' ? 'Administrateur' : 'Conseiller'}
+                  </p>
+                </div>
+              </div>
+            ))}
+            {activeUsers.length === 0 && (
+              <p className="text-[10px] text-slate-500 italic">Aucun autre utilisateur en ligne</p>
+            )}
+          </div>
+        </div>
+
+         <div className="mt-auto pt-8 border-t border-white/10">
           <div className="flex items-center gap-3 p-2">
-            <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center text-blue-400 font-bold">
-              AD
+            <div className="w-10 h-10 rounded-full bg-blue-500/20 flex items-center justify-center text-blue-400 font-bold uppercase">
+              {currentUser?.name ? currentUser.name.substring(0, 2) : 'AD'}
             </div>
             <div className="overflow-hidden">
-              <p className="text-sm font-bold truncate">Admin TED</p>
+              <p className="text-sm font-bold truncate">{currentUser?.name || 'Admin TED'}</p>
+              <p className="text-[10px] text-slate-400 font-semibold leading-none mb-1 shadow-xs">
+                {currentUser?.role === 'admin' 
+                  ? 'Administrateur' 
+                  : currentUser?.role === 'manager' 
+                    ? 'Manager' 
+                    : currentUser?.role === 'supervisor' 
+                      ? 'Superviseur' 
+                      : 'Conseiller'}
+              </p>
               <button 
                 onClick={onLogout}
-                className="text-xs text-slate-400 hover:text-white"
+                className="text-xs text-slate-300 hover:text-white underline decoration-dotted"
               >
                 Déconnexion
               </button>
@@ -706,6 +931,41 @@ export default function AdminDashboard({
       {/* Main Content Area */}
       <main className="flex-1 p-6 md:p-12 overflow-x-hidden">
         
+        {(currentUser?.role === 'manager' || currentUser?.role === 'supervisor') && (
+          <div className="mb-8 p-6 bg-gradient-to-r from-blue-950 via-slate-900 to-indigo-950 text-white rounded-3xl shadow-sm border border-indigo-950/40 relative overflow-hidden">
+            <div className="absolute right-0 top-0 translate-x-1/4 -translate-y-1/4 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl pointer-events-none" />
+            <div className="relative flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <span className="text-[10px] bg-blue-500/30 text-blue-200 border border-blue-400/20 px-2.5 py-1 rounded-full font-black uppercase tracking-wider">
+                  ⚡ Mode {currentUser.role === 'manager' ? 'Pilotage Manager' : 'Supervision Équipe'} Actif
+                </span>
+                <h2 className="text-xl font-black mt-2 tracking-tight">Bonjour {currentUser.name}, pilotez votre production en temps réel</h2>
+                <p className="text-xs text-slate-300 font-medium mt-1">
+                  Ce tableau de bord est optimisé pour suivre l'activité de vos conseillers, analyser les temps de traitement et qualifier les performances individuelles.
+                </p>
+              </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <div className="bg-white/10 border border-white/10 p-3 rounded-2xl text-center min-w-[110px]">
+                  <p className="text-[9px] text-blue-200 font-bold uppercase tracking-wider">Actifs en direct</p>
+                  <p className="text-xl font-black text-emerald-400 mt-0.5">
+                    {onlineUsers.filter(u => u.status === 'en_ligne').length} <span className="text-xs font-semibold text-white">agents</span>
+                  </p>
+                </div>
+                <div className="bg-white/10 border border-white/10 p-3 rounded-2xl text-center min-w-[110px]">
+                  <p className="text-[9px] text-blue-200 font-bold uppercase tracking-wider">Taux de qualif</p>
+                  <p className="text-xl font-black text-blue-300 mt-0.5">
+                    {(() => {
+                      const qualified = leads.filter(l => l.status === 'qualified').length;
+                      const total = leads.filter(l => l.assignedAgentId).length;
+                      return total > 0 ? Math.round((qualified / total) * 100) : 0;
+                    })()}%
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        
         {/* LEADS TAB */}
         {activeTab === 'leads' && (
           <>
@@ -714,11 +974,17 @@ export default function AdminDashboard({
                 <h1 className="text-3xl font-bold text-slate-900 mb-2">Suivi des Leads</h1>
                 <p className="text-slate-500 font-medium">Gérez le portefeuille des clients, l'affectation commerciale et l'état des opportunités.</p>
                 {lastSync && (
-                  <div className="flex items-center gap-2 mt-2">
-                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
-                      Flux Connecté • {lastSync.toLocaleTimeString()}
-                    </span>
+                  <div className="flex items-center gap-4 mt-2 flex-wrap">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                      <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                        Flux Connecté • {lastSync.toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-full text-[9px] font-black text-slate-500 uppercase tracking-widest">
+                      <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
+                      {activeUsers.length} en ligne
+                    </div>
                   </div>
                 )}
               </div>
@@ -906,100 +1172,559 @@ export default function AdminDashboard({
         {/* AGENTS / ACCESS REGISTER TAB */}
         {activeTab === 'agents' && (
           <>
-            <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mb-12">
+            <header className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mb-8">
               <div>
-                <h1 className="text-3xl font-bold text-slate-900 mb-2">Conseillers & Accès</h1>
-                <p className="text-slate-500 font-medium">Gérez l'équipe de conseillers commerciaux CRM et distribuez leurs identifiants de vente.</p>
+                <h1 className="text-3xl font-bold text-slate-900 mb-2">
+                  {agentsSubTab === 'agents' && 'Conseillers & Accès'}
+                  {agentsSubTab === 'supervisors' && 'Superviseurs & Accès'}
+                  {agentsSubTab === 'managers' && 'Managers & Accès'}
+                  {agentsSubTab === 'teams' && 'Gestion des Équipes & Projets'}
+                </h1>
+                <p className="text-slate-500 font-medium">
+                  {agentsSubTab === 'agents' && "Gérez l'équipe de conseillers commerciaux CRM et distribuez leurs identifiants de vente."}
+                  {agentsSubTab === 'supervisors' && "Gérez les superviseurs d'équipes et de projets pour l'encadrement en temps réel."}
+                  {agentsSubTab === 'managers' && "Gérez les managers de projets et pilotez leurs affectations sur plusieurs équipes."}
+                  {agentsSubTab === 'teams' && "Créez des équipes commerciales, attribuez plusieurs superviseurs et managers et suivez leurs statistiques de vente."}
+                </p>
               </div>
-              <button 
-                onClick={() => setShowAddAgentModal(true)}
-                className="btn-primary flex items-center gap-2 text-sm"
-              >
-                <Plus size={18} />
-                Nouvel Accès Agent
-              </button>
+              {(currentUser?.role === 'admin' || currentUser?.role === 'manager') && (
+                <div>
+                  {agentsSubTab !== 'teams' ? (
+                    <button 
+                      onClick={() => {
+                        // Pre-select the role based on sub-tab
+                        setNewAgent({
+                          name: '',
+                          email: '',
+                          password: Math.random().toString(36).substr(2, 8).toUpperCase(),
+                          role: agentsSubTab === 'supervisors' ? 'supervisor' : agentsSubTab === 'managers' ? 'manager' : 'agent',
+                          team: ''
+                        });
+                        setShowAddAgentModal(true);
+                      }}
+                      className="btn-primary flex items-center gap-2 text-sm cursor-pointer"
+                    >
+                      <Plus size={18} />
+                      {agentsSubTab === 'supervisors' ? 'Nouvel Accès Superviseur' : agentsSubTab === 'managers' ? 'Nouvel Accès Manager' : 'Nouvel Accès Conseiller'}
+                    </button>
+                  ) : (
+                    <button 
+                      onClick={() => {
+                        setNewTeam({ name: '', supervisorId: '', supervisorIds: [], managerIds: [] });
+                        setShowAddTeamModal(true);
+                      }}
+                      className="btn-primary flex items-center gap-2 text-sm cursor-pointer"
+                    >
+                      <Plus size={18} />
+                      Créer une Équipe
+                    </button>
+                  )}
+                </div>
+              )}
             </header>
 
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
-              <table className="w-full text-left">
-                <thead className="bg-slate-50 border-b border-slate-200">
-                  <tr>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Conseiller</th>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Statut Accès</th>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Identifiant (Email)</th>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Mot de passe de Connexion</th>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Leads Assujettis</th>
-                    <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {agents.map((agent) => {
-                    const assignedLeadsCount = leads.filter(l => l.assignedAgentId === agent.id).length;
-                    return (
-                      <tr key={agent.id} className="hover:bg-slate-50/70 transition-colors">
-                        <td className="px-6 py-4 font-bold text-slate-900">{agent.name}</td>
-                        <td className="px-6 py-4">
-                          <button 
-                            onClick={() => toggleAgentStatus(agent)}
-                            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold cursor-pointer ${
-                              agent.isActive 
-                                ? 'bg-green-100 text-green-700' 
-                                : 'bg-red-100 text-red-700'
-                            }`}
-                          >
-                            <span className={`w-1.5 h-1.5 rounded-full ${agent.isActive ? 'bg-green-500' : 'bg-red-500'}`} />
-                            {agent.isActive ? 'Actif' : 'Suspendu'}
-                          </button>
-                        </td>
-                        <td className="px-6 py-4 text-sm text-slate-600 font-mono select-all">
-                          {agent.email}
-                        </td>
-                        <td className="px-6 py-4 text-sm text-slate-600 font-mono">
-                          {agent.password}
-                        </td>
-                        <td className="px-6 py-4 text-sm font-extrabold text-blue-600">
-                          {assignedLeadsCount} leads assignés
-                        </td>
-                        <td className="px-6 py-4 text-right border-l-0">
-                          <div className="flex items-center justify-end gap-2">
+            {/* Sub-tabs for Agents, Supervisors, Managers and Teams */}
+            <div className="flex border-b border-slate-200 mb-8 gap-4 overflow-x-auto whitespace-nowrap scrollbar-hide">
+              <button
+                onClick={() => setAgentsSubTab('agents')}
+                className={`pb-4 px-2 text-sm font-bold border-b-2 transition-all cursor-pointer ${
+                  agentsSubTab === 'agents' 
+                    ? 'border-blue-600 text-blue-600' 
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                💼 Conseillers ({rawAgents.filter(a => !a.role || a.role === 'agent').length})
+              </button>
+              <button
+                onClick={() => setAgentsSubTab('supervisors')}
+                className={`pb-4 px-2 text-sm font-bold border-b-2 transition-all cursor-pointer ${
+                  agentsSubTab === 'supervisors' 
+                    ? 'border-blue-600 text-blue-600' 
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                👮 Superviseurs ({rawAgents.filter(a => a.role === 'supervisor').length})
+              </button>
+              <button
+                onClick={() => setAgentsSubTab('managers')}
+                className={`pb-4 px-2 text-sm font-bold border-b-2 transition-all cursor-pointer ${
+                  agentsSubTab === 'managers' 
+                    ? 'border-blue-600 text-blue-600' 
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                🚀 Managers ({rawAgents.filter(a => a.role === 'manager').length})
+              </button>
+              <button
+                onClick={() => setAgentsSubTab('teams')}
+                className={`pb-4 px-2 text-sm font-bold border-b-2 transition-all cursor-pointer ${
+                  agentsSubTab === 'teams' 
+                    ? 'border-blue-600 text-blue-600' 
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                📁 Équipes & Projets ({teams.length})
+              </button>
+            </div>
+
+            {agentsSubTab === 'agents' && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50 border-b border-slate-200">
+                    <tr>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Conseiller</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Statut Accès</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Identifiant (Email)</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Mot de passe de Connexion</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Équipe</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Leads Assujettis</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredAdvisors.map((agent) => {
+                      const assignedLeadsCount = leads.filter(l => l.assignedAgentId === agent.id).length;
+                      const isAgentOnline = activeUsers.some(u => u.email.toLowerCase().trim() === agent.email.toLowerCase().trim());
+                      
+                      const getRoleLabel = (r?: string) => {
+                        switch (r) {
+                          case 'supervisor': return 'Superviseur';
+                          case 'manager': return 'Manager CRM';
+                          case 'admin': return 'Administrateur';
+                          default: return 'Conseiller commercial';
+                        }
+                      };
+
+                      return (
+                        <tr key={agent.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="px-6 py-4 font-bold text-slate-900">
+                            <div className="flex items-center gap-2.5">
+                              <div className="relative">
+                                <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center text-xs font-bold text-blue-600 uppercase">
+                                  {agent.name ? agent.name.substring(0, 2) : '??'}
+                                </div>
+                                <span className={`absolute bottom-0 right-0 block h-2.5 w-2.5 rounded-full ring-2 ring-white ${isAgentOnline ? 'bg-green-500' : 'bg-slate-300'}`} />
+                              </div>
+                              <div>
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                                  {agent.name}
+                                  {isAgentOnline && (
+                                    <span className="bg-emerald-100 text-emerald-700 text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full tracking-wider">
+                                      En ligne
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                                  {getRoleLabel(agent.role)}
+                                </span>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4">
                             <button 
-                              onClick={() => onImpersonateAgent?.(agent.id)}
-                              className="px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 font-extrabold text-[10px] uppercase tracking-wider rounded-lg transition-all flex items-center gap-1 cursor-pointer border border-amber-200 shadow-3xs"
-                              title="Simuler et basculer sur la session de ce conseiller"
+                              onClick={() => toggleAgentStatus(agent)}
+                              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold cursor-pointer ${
+                                agent.isActive 
+                                  ? 'bg-green-100 text-green-700' 
+                                  : 'bg-red-100 text-red-700'
+                              }`}
                             >
-                              <UserCheck size={13} />
-                              <span>Simuler vue</span>
+                              <span className={`w-1.5 h-1.5 rounded-full ${agent.isActive ? 'bg-green-500' : 'bg-red-500'}`} />
+                              {agent.isActive ? 'Actif' : 'Suspendu'}
                             </button>
-                            <button 
-                              onClick={() => {
-                                setSelectedAgent(agent);
-                                setShowEditAgentModal(true);
-                              }}
-                              className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
-                            >
-                              <Edit2 size={16} />
-                            </button>
-                            <button 
-                              onClick={() => onDeleteAgent(agent.id)}
-                              className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                            >
-                              <Trash2 size={16} />
-                            </button>
-                          </div>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono select-all">
+                            {agent.email}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono">
+                            {agent.password}
+                          </td>
+                          <td className="px-6 py-4">
+                            <span className="px-2.5 py-1 text-xs font-bold rounded-full bg-slate-100 text-slate-700 border border-slate-200">
+                              {agent.team || 'Sans Équipe'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 text-sm font-extrabold text-blue-600">
+                            {assignedLeadsCount} leads assignés
+                          </td>
+                          <td className="px-6 py-4 text-right border-l-0">
+                            <div className="flex items-center justify-end gap-2">
+                              <button 
+                                onClick={() => onImpersonateAgent?.(agent.id)}
+                                className="px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 font-extrabold text-[10px] uppercase tracking-wider rounded-lg transition-all flex items-center gap-1 cursor-pointer border border-amber-200 shadow-3xs"
+                                title="Simuler et basculer sur la session de ce conseiller"
+                              >
+                                <UserCheck size={13} />
+                                <span>Simuler vue</span>
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setSelectedAgent(agent);
+                                  setShowEditAgentModal(true);
+                                }}
+                                className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Edit2 size={16} />
+                              </button>
+                              <button 
+                                onClick={() => onDeleteAgent(agent.id)}
+                                className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {filteredAdvisors.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="px-6 py-12 text-center text-slate-400 italic">
+                          Aucun conseiller n'est configuré pour le moment.
                         </td>
                       </tr>
-                    );
-                  })}
-                  {agents.length === 0 && (
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {agentsSubTab === 'supervisors' && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50 border-b border-slate-200">
                     <tr>
-                      <td colSpan={6} className="px-6 py-12 text-center text-slate-400 italic">
-                        Aucun conseiller n'est configuré pour le moment.
-                      </td>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Superviseur</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Statut Accès</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Identifiant (Email)</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Mot de passe</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Équipes Supervisées</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Membres Encadrés</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Actions</th>
                     </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredSupervisors.map((agent) => {
+                      const supervisedTeamList = teams.filter(t => 
+                        t.supervisorId?.toLowerCase().trim() === agent.email.toLowerCase().trim() ||
+                        (t.supervisorIds && t.supervisorIds.some(email => email.toLowerCase().trim() === agent.email.toLowerCase().trim()))
+                      );
+                      const membersCount = rawAgents.filter(a => supervisedTeamList.some(t => t.name === a.team)).length;
+                      const isAgentOnline = activeUsers.some(u => u.email.toLowerCase().trim() === agent.email.toLowerCase().trim());
+                      
+                      return (
+                        <tr key={agent.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="px-6 py-4 font-bold text-slate-900">
+                            <div className="flex items-center gap-2.5">
+                              <div className="relative">
+                                <div className="w-8 h-8 rounded-full bg-indigo-50 flex items-center justify-center text-xs font-bold text-indigo-600 uppercase">
+                                  {agent.name ? agent.name.substring(0, 2) : '??'}
+                                </div>
+                                <span className={`absolute bottom-0 right-0 block h-2.5 w-2.5 rounded-full ring-2 ring-white ${isAgentOnline ? 'bg-green-500' : 'bg-slate-300'}`} />
+                              </div>
+                              <div>
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                                  {agent.name}
+                                </div>
+                                <span className="text-[10px] text-indigo-500 font-bold uppercase tracking-wider">
+                                  Superviseur
+                                </span>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4">
+                            <button 
+                              onClick={() => toggleAgentStatus(agent)}
+                              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold cursor-pointer ${
+                                agent.isActive 
+                                  ? 'bg-green-100 text-green-700' 
+                                  : 'bg-red-100 text-red-700'
+                              }`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${agent.isActive ? 'bg-green-500' : 'bg-red-500'}`} />
+                              {agent.isActive ? 'Actif' : 'Suspendu'}
+                            </button>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono select-all">
+                            {agent.email}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono">
+                            {agent.password}
+                          </td>
+                          <td className="px-6 py-4">
+                            <div className="flex flex-wrap gap-1 max-w-[200px]">
+                              {supervisedTeamList.length > 0 ? supervisedTeamList.map(t => (
+                                <span key={t.id} className="px-2 py-0.5 text-[10px] font-black rounded-md bg-indigo-50 text-indigo-700 border border-indigo-100">
+                                  {t.name}
+                                </span>
+                              )) : (
+                                <span className="text-xs text-slate-400 italic">Aucune</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-sm font-extrabold text-indigo-600">
+                            {membersCount} conseillers
+                          </td>
+                          <td className="px-6 py-4 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button 
+                                onClick={() => {
+                                  setSelectedAgent(agent);
+                                  setShowEditAgentModal(true);
+                                }}
+                                className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Edit2 size={16} />
+                              </button>
+                              <button 
+                                onClick={() => onDeleteAgent(agent.id)}
+                                className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {filteredSupervisors.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="px-6 py-12 text-center text-slate-400 italic">
+                          Aucun superviseur n'est configuré pour le moment.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {agentsSubTab === 'managers' && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50 border-b border-slate-200">
+                    <tr>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Manager</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Statut Accès</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Identifiant (Email)</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Mot de passe</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Équipes / Projets Affectés</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredManagers.map((agent) => {
+                      const managedTeamList = teams.filter(t => 
+                        t.managerIds && t.managerIds.some(email => email.toLowerCase().trim() === agent.email.toLowerCase().trim())
+                      );
+                      const isAgentOnline = activeUsers.some(u => u.email.toLowerCase().trim() === agent.email.toLowerCase().trim());
+                      
+                      return (
+                        <tr key={agent.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="px-6 py-4 font-bold text-slate-900">
+                            <div className="flex items-center gap-2.5">
+                              <div className="relative">
+                                <div className="w-8 h-8 rounded-full bg-emerald-50 flex items-center justify-center text-xs font-bold text-emerald-600 uppercase">
+                                  {agent.name ? agent.name.substring(0, 2) : '??'}
+                                </div>
+                                <span className={`absolute bottom-0 right-0 block h-2.5 w-2.5 rounded-full ring-2 ring-white ${isAgentOnline ? 'bg-green-500' : 'bg-slate-300'}`} />
+                              </div>
+                              <div>
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                                  {agent.name}
+                                </div>
+                                <span className="text-[10px] text-emerald-600 font-bold uppercase tracking-wider">
+                                  Manager
+                                </span>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4">
+                            <button 
+                              onClick={() => toggleAgentStatus(agent)}
+                              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold cursor-pointer ${
+                                agent.isActive 
+                                  ? 'bg-green-100 text-green-700' 
+                                  : 'bg-red-100 text-red-700'
+                              }`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${agent.isActive ? 'bg-green-500' : 'bg-red-500'}`} />
+                              {agent.isActive ? 'Actif' : 'Suspendu'}
+                            </button>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono select-all">
+                            {agent.email}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600 font-mono">
+                            {agent.password}
+                          </td>
+                          <td className="px-6 py-4">
+                            <div className="flex flex-wrap gap-1 max-w-[200px]">
+                              {managedTeamList.length > 0 ? managedTeamList.map(t => (
+                                <span key={t.id} className="px-2 py-0.5 text-[10px] font-black rounded-md bg-emerald-50 text-emerald-700 border border-emerald-100">
+                                  {t.name}
+                                </span>
+                              )) : (
+                                <span className="text-xs text-slate-400 italic">Tous les projets (Global)</span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button 
+                                onClick={() => {
+                                  setSelectedAgent(agent);
+                                  setShowEditAgentModal(true);
+                                }}
+                                className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Edit2 size={16} />
+                              </button>
+                              <button 
+                                onClick={() => onDeleteAgent(agent.id)}
+                                className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all cursor-pointer"
+                              >
+                                <Trash2 size={16} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {filteredManagers.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="px-6 py-12 text-center text-slate-400 italic">
+                          Aucun manager n'est configuré pour le moment.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {agentsSubTab === 'teams' && (
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50 border-b border-slate-200">
+                    <tr>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Équipe / Projet</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Superviseurs Assignés</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Managers Assignés</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Nombre de Membres</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Leads Assujettis</th>
+                      <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest">Date de Création</th>
+                      {(currentUser?.role === 'admin' || currentUser?.role === 'manager') && (
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-widest text-right">Actions</th>
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredTeamsForRole.map((team) => {
+                      const teamMembers = rawAgents.filter(a => a.team === team.name);
+                      const teamLeadsCount = rawLeads.filter(l => l.assignedAgentId && teamMembers.some(a => a.id === l.assignedAgentId)).length;
+                      
+                      return (
+                        <tr key={team.id} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="px-6 py-4 font-bold text-slate-900">
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 font-bold text-sm uppercase">
+                                {team.name.substring(0, 2)}
+                              </div>
+                              <div>
+                                <span className="font-bold text-slate-900">{team.name}</span>
+                              </div>
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600">
+                            <div className="flex flex-wrap gap-1 max-w-[200px]">
+                              {(() => {
+                                const sups = team.supervisorIds && team.supervisorIds.length > 0
+                                  ? team.supervisorIds
+                                  : (team.supervisorId ? [team.supervisorId] : []);
+                                
+                                if (sups.length === 0) {
+                                  return <span className="text-slate-400 italic text-xs">Aucun</span>;
+                                }
+
+                                return sups.map(email => {
+                                  const supAgent = rawAgents.find(a => a.email.toLowerCase().trim() === email.toLowerCase().trim());
+                                  return (
+                                    <div key={email} className="inline-flex items-center gap-1 bg-indigo-50 border border-indigo-100/55 text-indigo-700 px-2 py-0.5 rounded-md text-[11px] font-bold">
+                                      <span>{supAgent ? supAgent.name : email}</span>
+                                    </div>
+                                  );
+                                });
+                              })()}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-600">
+                            <div className="flex flex-wrap gap-1 max-w-[200px]">
+                              {(() => {
+                                const mans = team.managerIds || [];
+                                if (mans.length === 0) {
+                                  return <span className="text-slate-400 italic text-xs">Aucun (Tous les Managers)</span>;
+                                }
+
+                                return mans.map(email => {
+                                  const manAgent = rawAgents.find(a => a.email.toLowerCase().trim() === email.toLowerCase().trim());
+                                  return (
+                                    <div key={email} className="inline-flex items-center gap-1 bg-emerald-50 border border-emerald-100/55 text-emerald-700 px-2 py-0.5 rounded-md text-[11px] font-bold">
+                                      <span>{manAgent ? manAgent.name : email}</span>
+                                    </div>
+                                  );
+                                });
+                              })()}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 text-sm font-bold text-slate-700">
+                            {teamMembers.length} agents
+                          </td>
+                          <td className="px-6 py-4 text-sm font-bold text-blue-600">
+                            {teamLeadsCount} leads
+                          </td>
+                          <td className="px-6 py-4 text-sm text-slate-500">
+                            {team.createdAt ? new Date(team.createdAt).toLocaleDateString('fr-FR') : '-'}
+                          </td>
+                          {(currentUser?.role === 'admin' || currentUser?.role === 'manager') && (
+                            <td className="px-6 py-4 text-right">
+                              <div className="flex items-center justify-end gap-2">
+                                <button 
+                                  onClick={() => {
+                                    setSelectedTeam({
+                                      ...team,
+                                      supervisorIds: team.supervisorIds || (team.supervisorId ? [team.supervisorId] : []),
+                                      managerIds: team.managerIds || []
+                                    });
+                                    setShowEditTeamModal(true);
+                                  }}
+                                  className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all cursor-pointer"
+                                >
+                                  <Edit2 size={16} />
+                                </button>
+                                <button 
+                                  onClick={() => onDeleteTeam?.(team.id)}
+                                  className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all cursor-pointer"
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </div>
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
+                    {filteredTeamsForRole.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="px-6 py-12 text-center text-slate-400 italic">
+                          Aucune équipe n'est configurée pour le moment.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </>
         )}
 
@@ -1324,6 +2049,990 @@ export default function AdminDashboard({
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* PRESENCE TAB */}
+        {activeTab === 'presence' && (
+          <div className="space-y-8">
+            <header className="mb-6">
+              <h1 className="text-3xl font-extrabold text-slate-950 tracking-tight">Suivi de Présence des Agents</h1>
+              <p className="text-slate-500 font-medium mt-1">Supervisez l'état de connexion de l'équipe en temps réel et consultez l'historique complet d'activité.</p>
+            </header>
+
+            {/* Real-time status list */}
+            <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm">
+              <h2 className="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2">
+                <span className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                </span>
+                Présence en Temps Réel ({onlineUsers.length} actifs)
+              </h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {agents.map((agent) => {
+                  const conn = onlineUsers.find(u => u.email.toLowerCase().trim() === agent.email.toLowerCase().trim());
+                  const status = conn?.status || 'deconnecte';
+                  
+                  return (
+                    <div 
+                      key={agent.id} 
+                      className={`p-4 rounded-2xl border transition-all flex flex-col justify-between ${
+                        status === 'en_ligne' 
+                          ? 'bg-emerald-50/40 border-emerald-100 shadow-sm' 
+                          : status === 'en_pause'
+                          ? 'bg-amber-50/40 border-amber-100 shadow-sm'
+                          : 'bg-slate-50/50 border-slate-100 opacity-75'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <p className="font-bold text-slate-900 text-sm">{agent.name}</p>
+                          <p className="text-xs text-slate-500 mt-0.5">{agent.email}</p>
+                          <p className="text-[10px] uppercase font-bold text-slate-400 mt-2">Conseiller</p>
+                        </div>
+                        
+                        {status === 'en_ligne' ? (
+                          <span className="text-[11px] font-black bg-emerald-500 text-white px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-sm shadow-emerald-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse"></span>
+                            En ligne
+                          </span>
+                        ) : status === 'en_pause' ? (
+                          <span className="text-[11px] font-black bg-amber-500 text-white px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-sm shadow-amber-200">
+                            <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse"></span>
+                            En pause
+                          </span>
+                        ) : (
+                          <span className="text-[11px] font-bold bg-slate-200 text-slate-600 px-2.5 py-1 rounded-full">
+                            Déconnecté
+                          </span>
+                        )}
+                      </div>
+
+                      {(status === 'en_ligne' || status === 'en_pause') && conn?.statusStartedAt && (
+                        <div className="mt-4 pt-3 border-t border-dashed border-slate-200 flex justify-between items-center text-xs">
+                          <span className="text-slate-400 font-semibold">Statut depuis :</span>
+                          <span className="font-mono font-bold text-slate-800">
+                            {new Date(conn.statusStartedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} ({(() => {
+                              const start = new Date(conn.statusStartedAt).getTime();
+                              const diffMs = Date.now() - start;
+                              if (isNaN(diffMs) || diffMs < 0) return '0 min';
+                              const mins = Math.round(diffMs / 60000);
+                              return mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
+                            })()})
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Historical logs table */}
+            <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900">Historique de Présence & Pauses</h2>
+                  <p className="text-xs text-slate-400 font-semibold">Consultez les heures de connexion, déconnexion et de pause de tous les agents.</p>
+                </div>
+
+                {/* Filters */}
+                <div className="flex flex-wrap items-center gap-3">
+                  <div>
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Filtrer par Agent</label>
+                    <select
+                      value={presenceAgentFilter}
+                      onChange={(e) => setPresenceAgentFilter(e.target.value)}
+                      className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Tous les agents</option>
+                      {agents.map(a => (
+                        <option key={a.id} value={a.email}>{a.name}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Filtrer par Statut</label>
+                    <select
+                      value={presenceStatusFilter}
+                      onChange={(e) => setPresenceStatusFilter(e.target.value)}
+                      className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Tous les statuts</option>
+                      <option value="en_ligne">Activité (En ligne)</option>
+                      <option value="en_pause">Pause</option>
+                      <option value="deconnecte">Déconnexion</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Période</label>
+                    <select
+                      value={presenceTimeframe}
+                      onChange={(e) => setPresenceTimeframe(e.target.value as any)}
+                      className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Toute la période</option>
+                      <option value="dayOfWeek">Jour de la Semaine</option>
+                      <option value="date">Date Spécifique</option>
+                      <option value="month">Par Mois</option>
+                    </select>
+                  </div>
+
+                  {presenceTimeframe === 'dayOfWeek' && (
+                    <div>
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Jour</label>
+                      <select
+                        value={presenceDayOfWeek}
+                        onChange={(e) => setPresenceDayOfWeek(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="all">Tous les jours</option>
+                        <option value="1">Lundi</option>
+                        <option value="2">Mardi</option>
+                        <option value="3">Mercredi</option>
+                        <option value="4">Jeudi</option>
+                        <option value="5">Vendredi</option>
+                        <option value="6">Samedi</option>
+                        <option value="0">Dimanche</option>
+                      </select>
+                    </div>
+                  )}
+
+                  {presenceTimeframe === 'date' && (
+                    <div>
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Choisir Date</label>
+                      <input
+                        type="date"
+                        value={presenceDate}
+                        onChange={(e) => setPresenceDate(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1 px-2 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+                  )}
+
+                  {presenceTimeframe === 'month' && (
+                    <div>
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Choisir Mois</label>
+                      <input
+                        type="month"
+                        value={presenceMonth}
+                        onChange={(e) => setPresenceMonth(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1 px-2 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Presence logs table list */}
+              <div className="overflow-x-auto border border-slate-100 rounded-2xl">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100">
+                      <th className="px-6 py-3.5">Agent</th>
+                      <th className="px-6 py-3.5">Rôle</th>
+                      <th className="px-6 py-3.5">Évènement</th>
+                      <th className="px-6 py-3.5">Heure Début</th>
+                      <th className="px-6 py-3.5">Heure Fin</th>
+                      <th className="px-6 py-3.5">Durée</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                    {(() => {
+                      const filtered = presenceLogs.filter(log => {
+                        const agentMatch = presenceAgentFilter === 'all' || log.email.toLowerCase() === presenceAgentFilter.toLowerCase();
+                        const statusMatch = presenceStatusFilter === 'all' || log.status === presenceStatusFilter;
+                        
+                        let timeframeMatch = true;
+                        if (log.startedAt) {
+                          const logDateObj = new Date(log.startedAt);
+                          if (presenceTimeframe === 'dayOfWeek' && presenceDayOfWeek !== 'all') {
+                            timeframeMatch = logDateObj.getDay() === Number(presenceDayOfWeek);
+                          } else if (presenceTimeframe === 'date' && presenceDate) {
+                            const yyyy = logDateObj.getFullYear();
+                            const mm = String(logDateObj.getMonth() + 1).padStart(2, '0');
+                            const dd = String(logDateObj.getDate()).padStart(2, '0');
+                            timeframeMatch = `${yyyy}-${mm}-${dd}` === presenceDate;
+                          } else if (presenceTimeframe === 'month' && presenceMonth) {
+                            const yyyy = logDateObj.getFullYear();
+                            const mm = String(logDateObj.getMonth() + 1).padStart(2, '0');
+                            timeframeMatch = `${yyyy}-${mm}` === presenceMonth;
+                          }
+                        }
+                        
+                        return agentMatch && statusMatch && timeframeMatch;
+                      });
+
+                      if (filtered.length === 0) {
+                        return (
+                          <tr>
+                            <td colSpan={6} className="text-center py-8 text-slate-400 italic">
+                              Aucun log d'activité enregistré pour ces critères.
+                            </td>
+                          </tr>
+                        );
+                      }
+
+                      return filtered.map((log) => (
+                        <tr key={log.id || log.startedAt} className="hover:bg-slate-50/50">
+                          <td className="px-6 py-3.5">
+                            <p className="font-bold text-slate-900">{log.name}</p>
+                            <p className="text-[10px] text-slate-400 font-semibold">{log.email}</p>
+                          </td>
+                          <td className="px-6 py-3.5 text-slate-500">
+                            {log.role === 'admin' ? 'Administrateur' : 'Conseiller'}
+                          </td>
+                          <td className="px-6 py-3.5">
+                            {log.status === 'en_ligne' ? (
+                              <span className="bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-full text-[10px] font-extrabold border border-emerald-100 flex items-center gap-1 w-fit">
+                                <span className="h-1 w-1 rounded-full bg-emerald-500"></span>
+                                Activité
+                              </span>
+                            ) : log.status === 'en_pause' ? (
+                              <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded-full text-[10px] font-extrabold border border-amber-100 flex items-center gap-1 w-fit">
+                                <span className="h-1 w-1 rounded-full bg-amber-500"></span>
+                                Pause
+                              </span>
+                            ) : (
+                              <span className="bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1 w-fit">
+                                <span className="h-1 w-1 rounded-full bg-slate-400"></span>
+                                Déconnexion
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-6 py-3.5 font-mono text-slate-600">
+                            {new Date(log.startedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                          </td>
+                          <td className="px-6 py-3.5 font-mono text-slate-600">
+                            {log.endedAt 
+                              ? new Date(log.endedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) 
+                              : <span className="text-emerald-600 font-extrabold animate-pulse">En cours...</span>
+                            }
+                          </td>
+                          <td className="px-6 py-3.5 font-mono font-bold text-slate-900">
+                            {log.endedAt ? (
+                              log.durationMinutes < 1 
+                                ? 'Moins d\'une min' 
+                                : log.durationMinutes < 60
+                                ? `${log.durationMinutes} min`
+                                : `${Math.floor(log.durationMinutes / 60)}h ${log.durationMinutes % 60}m`
+                            ) : (
+                              <span className="text-emerald-600 font-extrabold animate-pulse">En cours</span>
+                            )}
+                          </td>
+                        </tr>
+                      ));
+                    })()}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* PERFORMANCE TAB */}
+        {activeTab === 'performance' && (
+          <div className="space-y-8">
+            <header className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h1 className="text-3xl font-extrabold text-slate-950 tracking-tight">Performances de l'Équipe & KPIs</h1>
+                <p className="text-slate-500 font-medium mt-1">Évaluez l'efficacité des conseillers, suivez les temps moyens de qualification des leads, et pilotez les taux de conversion.</p>
+              </div>
+            </header>
+
+            {/* Control Filters for Performance & KPIs */}
+            <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm">
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center gap-2">
+                  <SlidersHorizontal size={18} className="text-blue-600" />
+                  <h3 className="font-bold text-slate-900 text-sm">Filtres de Performance Globale</h3>
+                </div>
+                
+                <div className="flex flex-wrap items-center gap-4">
+                  {/* Agent Filter */}
+                  <div className="min-w-[150px]">
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Filtrer par Conseiller</label>
+                    <select
+                      value={perfAgentFilter}
+                      onChange={(e) => setPerfAgentFilter(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-2 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Tous les conseillers</option>
+                      {agents.map(a => (
+                        <option key={a.id} value={a.id}>{a.name}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Team Filter */}
+                  <div className="min-w-[150px]">
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Filtrer par Équipe</label>
+                    <select
+                      value={perfTeamFilter}
+                      onChange={(e) => setPerfTeamFilter(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-2 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Toutes les équipes</option>
+                      {Array.from(new Set(agents.map(a => a.team).filter(Boolean))).map((t, idx) => (
+                        <option key={idx} value={t}>{t}</option>
+                      ))}
+                      <option value="Sans Équipe">Sans Équipe</option>
+                    </select>
+                  </div>
+
+                  {/* Period Filter */}
+                  <div className="min-w-[150px]">
+                    <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Période</label>
+                    <select
+                      value={perfTimeframe}
+                      onChange={(e) => setPerfTimeframe(e.target.value as any)}
+                      className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-2 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    >
+                      <option value="all">Toute la période</option>
+                      <option value="dayOfWeek">Jour de la Semaine</option>
+                      <option value="date">Date Spécifique</option>
+                      <option value="month">Par Mois</option>
+                    </select>
+                  </div>
+
+                  {/* Day of Week */}
+                  {perfTimeframe === 'dayOfWeek' && (
+                    <div className="min-w-[150px]">
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Jour de la semaine</label>
+                      <select
+                        value={perfDayOfWeek}
+                        onChange={(e) => setPerfDayOfWeek(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-2 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="all">Tous les jours</option>
+                        <option value="1">Lundi</option>
+                        <option value="2">Mardi</option>
+                        <option value="3">Mercredi</option>
+                        <option value="4">Jeudi</option>
+                        <option value="5">Vendredi</option>
+                        <option value="6">Samedi</option>
+                        <option value="0">Dimanche</option>
+                      </select>
+                    </div>
+                  )}
+
+                  {/* Specific Date Picker */}
+                  {perfTimeframe === 'date' && (
+                    <div>
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Choisir Date</label>
+                      <input
+                        type="date"
+                        value={perfDate}
+                        onChange={(e) => setPerfDate(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+                  )}
+
+                  {/* Month Picker */}
+                  {perfTimeframe === 'month' && (
+                    <div>
+                      <label className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block mb-1">Choisir Mois</label>
+                      <input
+                        type="month"
+                        value={perfMonth}
+                        onChange={(e) => setPerfMonth(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-xl py-1.5 px-3 font-semibold focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Stats Dashboard */}
+            {(() => {
+              // Qualification duration helper (sum of active agent consultations)
+              const getQualMinutes = (lead: Lead) => {
+                if (lead.status !== 'qualified') return null;
+                
+                // Calculate total seconds spent consulting this lead
+                let totalSeconds = 0;
+                let hasValidDuration = false;
+                
+                if (lead.consultedBy && lead.consultedBy.length > 0) {
+                  lead.consultedBy.forEach(c => {
+                    if (c.durationSeconds !== undefined && c.durationSeconds > 0) {
+                      totalSeconds += c.durationSeconds;
+                      hasValidDuration = true;
+                    }
+                  });
+                }
+                
+                if (hasValidDuration) {
+                  return Math.max(1, Math.round(totalSeconds / 60));
+                }
+                
+                // Fallback for older leads (creation difference capped to a reasonable maximum)
+                const qEvent = lead.history?.find(h => 
+                  h.type === 'qualification' || 
+                  h.description.toLowerCase().includes('qualifié') ||
+                  h.description.toLowerCase().includes('qualified')
+                );
+                const end = qEvent ? new Date(qEvent.date).getTime() : new Date(lead.updatedAt).getTime();
+                const start = new Date(lead.createdAt).getTime();
+                const diff = end - start;
+                const fallbackMins = (isNaN(diff) || diff < 0) ? 0 : Math.round(diff / 60000);
+                return Math.min(15, fallbackMins || 2);
+              };
+
+              const formatMinToHuman = (mins: number) => {
+                if (mins <= 0) return 'N/A';
+                if (mins < 60) return `${mins} min`;
+                const hours = Math.floor(mins / 60);
+                const rem = mins % 60;
+                if (hours < 24) {
+                  return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
+                }
+                const days = Math.floor(hours / 24);
+                return `${days}j ${hours % 24}h`;
+              };
+
+              // Filtered leads based on the Performance control filters (agent, team, timeframe)
+              const perfLeads = leads.filter(lead => {
+                // Agent filter
+                if (perfAgentFilter !== 'all' && lead.assignedAgentId !== perfAgentFilter) {
+                  return false;
+                }
+                // Team filter
+                if (perfTeamFilter !== 'all') {
+                  const matchedAgent = agents.find(a => a.id === lead.assignedAgentId);
+                  const teamName = matchedAgent?.team || 'Sans Équipe';
+                  if (teamName !== perfTeamFilter) {
+                    return false;
+                  }
+                }
+                // Timeframe filters
+                if (lead.createdAt) {
+                  const dateObj = new Date(lead.createdAt);
+                  if (perfTimeframe === 'dayOfWeek' && perfDayOfWeek !== 'all') {
+                    if (dateObj.getDay() !== Number(perfDayOfWeek)) return false;
+                  } else if (perfTimeframe === 'date' && perfDate) {
+                    const yyyy = dateObj.getFullYear();
+                    const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+                    const dd = String(dateObj.getDate()).padStart(2, '0');
+                    if (`${yyyy}-${mm}-${dd}` !== perfDate) return false;
+                  } else if (perfTimeframe === 'month' && perfMonth) {
+                    const yyyy = dateObj.getFullYear();
+                    const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+                    if (`${yyyy}-${mm}` !== perfMonth) return false;
+                  }
+                }
+                return true;
+              });
+
+              const perfPresenceLogs = presenceLogs.filter(log => {
+                // Agent filter
+                if (perfAgentFilter !== 'all') {
+                  const matchedAgent = agents.find(a => a.id === perfAgentFilter);
+                  if (matchedAgent && log.email.toLowerCase() !== matchedAgent.email.toLowerCase()) {
+                    return false;
+                  }
+                }
+                // Team filter
+                if (perfTeamFilter !== 'all') {
+                  const matchedAgent = agents.find(a => a.email.toLowerCase() === log.email.toLowerCase());
+                  const teamName = matchedAgent?.team || 'Sans Équipe';
+                  if (teamName !== perfTeamFilter) {
+                    return false;
+                  }
+                }
+                // Timeframe filters
+                if (log.startedAt) {
+                  const dateObj = new Date(log.startedAt);
+                  if (perfTimeframe === 'dayOfWeek' && perfDayOfWeek !== 'all') {
+                    if (dateObj.getDay() !== Number(perfDayOfWeek)) return false;
+                  } else if (perfTimeframe === 'date' && perfDate) {
+                    const yyyy = dateObj.getFullYear();
+                    const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+                    const dd = String(dateObj.getDate()).padStart(2, '0');
+                    if (`${yyyy}-${mm}-${dd}` !== perfDate) return false;
+                  } else if (perfTimeframe === 'month' && perfMonth) {
+                    const yyyy = dateObj.getFullYear();
+                    const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+                    if (`${yyyy}-${mm}` !== perfMonth) return false;
+                  }
+                }
+                return true;
+              });
+
+              // Calculations
+              const qualifiedLeads = perfLeads.filter(l => l.status === 'qualified');
+              const lostLeads = perfLeads.filter(l => l.status === 'lost');
+              const inProgressLeads = perfLeads.filter(l => l.status === 'in_progress');
+              const totalAssigned = perfLeads.filter(l => l.assignedAgentId).length;
+
+              let teamTotalMinutes = 0;
+              let teamCountedLeads = 0;
+              qualifiedLeads.forEach(lead => {
+                const mins = getQualMinutes(lead);
+                if (mins !== null) {
+                  teamTotalMinutes += mins;
+                  teamCountedLeads++;
+                }
+              });
+
+              const teamAvgMins = teamCountedLeads > 0 ? Math.round(teamTotalMinutes / teamCountedLeads) : 0;
+              const globalConversionRate = totalAssigned > 0 ? Math.round((qualifiedLeads.length / totalAssigned) * 100) : 0;
+
+              return (
+                <>
+                  {/* Top KPIs Row */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div className="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Durée de Qualification</span>
+                        <h3 className="text-2xl font-black text-slate-900 mt-1">{formatMinToHuman(teamAvgMins)}</h3>
+                      </div>
+                      <p className="text-[11px] text-slate-500 font-semibold mt-4">Temps moyen équipe pour qualifier un lead</p>
+                    </div>
+
+                    <div className="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Fiches Qualifiées</span>
+                        <h3 className="text-2xl font-black text-slate-900 mt-1">{qualifiedLeads.length} leads</h3>
+                      </div>
+                      <p className="text-[11px] text-emerald-600 font-extrabold mt-4 flex items-center gap-1">
+                        <span>● {perfLeads.length > 0 ? Math.round((qualifiedLeads.length / perfLeads.length) * 100) : 0}%</span>
+                        <span className="text-slate-400 font-semibold">du total du CRM</span>
+                      </p>
+                    </div>
+
+                    <div className="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Taux de Qualification</span>
+                        <h3 className="text-2xl font-black text-slate-900 mt-1">{globalConversionRate}%</h3>
+                      </div>
+                      <p className="text-[11px] text-slate-500 font-semibold mt-4">Sur un total de {totalAssigned} fiches assignées</p>
+                    </div>
+
+                    <div className="bg-white rounded-3xl p-6 border border-slate-100 shadow-sm flex flex-col justify-between">
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Fiches Perdues / En cours</span>
+                        <h3 className="text-2xl font-black text-slate-900 mt-1">{lostLeads.length} / {inProgressLeads.length}</h3>
+                      </div>
+                      <p className="text-[11px] text-slate-500 font-semibold mt-4">Pertes : {totalAssigned > 0 ? Math.round((lostLeads.length / totalAssigned) * 100) : 0}% des attributions</p>
+                    </div>
+                  </div>
+
+                  {/* 📊 SECTEUR GRAPHIQUES ET ANALYSES VISUELLES */}
+                  {(() => {
+                    // Team grouping and rates calculation
+                    const teamsData = (() => {
+                      let teamNames = Array.from(new Set(agents.map(a => a.team || 'Sans Équipe')));
+                      if (perfTeamFilter !== 'all') {
+                        teamNames = teamNames.filter(t => t === perfTeamFilter);
+                      }
+                      
+                      return teamNames.map(teamName => {
+                        const teamAgents = agents.filter(a => (a.team || 'Sans Équipe') === teamName);
+                        const teamAgentIds = teamAgents.map(a => a.id);
+                        const teamLeads = perfLeads.filter(l => l.assignedAgentId && teamAgentIds.includes(l.assignedAgentId));
+                        const totalLeads = teamLeads.length;
+                        
+                        // Leads consulted: has at least one consultation record
+                        const consulted = teamLeads.filter(l => l.consultedBy && l.consultedBy.length > 0).length;
+                        const treated = teamLeads.filter(l => l.status !== 'new').length;
+                        const untreated = teamLeads.filter(l => l.status === 'new').length;
+                        const qualified = teamLeads.filter(l => l.status === 'qualified').length;
+                        
+                        const consultedRate = totalLeads > 0 ? Math.round((consulted / totalLeads) * 100) : 0;
+                        const treatedRate = totalLeads > 0 ? Math.round((treated / totalLeads) * 100) : 0;
+                        const untreatedRate = totalLeads > 0 ? Math.round((untreated / totalLeads) * 100) : 0;
+                        const qualifiedRate = totalLeads > 0 ? Math.round((qualified / totalLeads) * 100) : 0;
+                        
+                        return {
+                          teamName,
+                          totalLeads,
+                          consulted,
+                          consultedRate,
+                          treated,
+                          treatedRate,
+                          untreated,
+                          untreatedRate,
+                          qualified,
+                          qualifiedRate,
+                          agentsCount: teamAgents.length
+                        };
+                      });
+                    })();
+
+                    // Global Lead Status counts
+                    const statusCounts = [
+                      { name: 'Nouveau (Non Traité)', value: perfLeads.filter(l => l.status === 'new').length, color: '#f43f5e' },
+                      { name: 'En cours', value: perfLeads.filter(l => l.status === 'in_progress').length, color: '#3b82f6' },
+                      { name: 'Qualifié', value: perfLeads.filter(l => l.status === 'qualified').length, color: '#10b981' },
+                      { name: 'Perdu', value: perfLeads.filter(l => l.status === 'lost').length, color: '#64748b' }
+                    ].filter(item => item.value > 0);
+
+                    return (
+                      <>
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                          {/* Left: Bar Chart for Team Ratios */}
+                          <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4 lg:col-span-2">
+                            <div className="flex justify-between items-center">
+                              <h3 className="text-md font-bold text-slate-900 flex items-center gap-2">
+                                <TrendingUp size={18} className="text-blue-600" />
+                                <span>Ratios Comparatifs par Équipe (%)</span>
+                              </h3>
+                              <span className="text-[10px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-md font-extrabold uppercase">Ratios CRM</span>
+                            </div>
+                            <div className="h-64 mt-4">
+                              {teamsData.length === 0 || perfLeads.length === 0 ? (
+                                <div className="h-full flex items-center justify-center text-slate-400 italic text-xs">
+                                  Pas de données d'attribution d'équipe à afficher.
+                                </div>
+                              ) : (
+                                <ResponsiveContainer width="100%" height="100%">
+                                  <BarChart data={teamsData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                                    <XAxis dataKey="teamName" stroke="#64748b" fontSize={11} tickLine={false} />
+                                    <YAxis stroke="#64748b" fontSize={11} tickLine={false} domain={[0, 100]} />
+                                    <Tooltip 
+                                      contentStyle={{ background: '#0f172a', borderRadius: '12px', border: 'none', color: '#fff', fontSize: '11px' }}
+                                      itemStyle={{ color: '#fff' }}
+                                    />
+                                    <Legend iconSize={8} iconType="circle" wrapperStyle={{ fontSize: '11px', fontWeight: 'bold' }} />
+                                    <Bar dataKey="consultedRate" name="Taux Consulté" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                                    <Bar dataKey="treatedRate" name="Taux Traité" fill="#10b981" radius={[4, 4, 0, 0]} />
+                                    <Bar dataKey="untreatedRate" name="Taux Non Traité" fill="#f43f5e" radius={[4, 4, 0, 0]} />
+                                  </BarChart>
+                                </ResponsiveContainer>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Right: Pie Chart for Global Distribution */}
+                          <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4 lg:col-span-1">
+                            <h3 className="text-md font-bold text-slate-900 flex items-center gap-2">
+                              <Layers size={18} className="text-indigo-600" />
+                              <span>Distribution Globale</span>
+                            </h3>
+                            <div className="h-64 flex flex-col justify-between">
+                              <div className="h-44">
+                                {statusCounts.length === 0 ? (
+                                  <div className="h-full flex items-center justify-center text-slate-400 italic text-xs">
+                                    Aucun lead disponible.
+                                  </div>
+                                ) : (
+                                  <ResponsiveContainer width="100%" height="100%">
+                                    <PieChart>
+                                      <Pie
+                                        data={statusCounts}
+                                        cx="50%"
+                                        cy="50%"
+                                        innerRadius={50}
+                                        outerRadius={70}
+                                        paddingAngle={4}
+                                        dataKey="value"
+                                      >
+                                        {statusCounts.map((entry, index) => (
+                                          <Cell key={`cell-${index}`} fill={entry.color} />
+                                        ))}
+                                      </Pie>
+                                      <Tooltip formatter={(value) => [`${value} fiches`]} />
+                                    </PieChart>
+                                  </ResponsiveContainer>
+                                )}
+                              </div>
+                              <div className="grid grid-cols-2 gap-2 text-[10px] font-bold text-slate-500 mt-2">
+                                {statusCounts.map((s, idx) => (
+                                  <div key={idx} className="flex items-center gap-1">
+                                    <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: s.color }}></span>
+                                    <span className="truncate">{s.name}: {s.value}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* 📊 TABLEAU DE RATIOS PAR ÉQUIPE */}
+                        <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4">
+                          <div>
+                            <h2 className="text-lg font-bold text-slate-900">Suivi & Ratios de Traitement par Équipe</h2>
+                            <p className="text-xs text-slate-400 font-semibold mt-0.5">Synthèse comparative de l'effort des équipes : fiches ouvertes, fiches traitées et fiches restées à l'abandon ("Nouveau").</p>
+                          </div>
+                          
+                          <div className="overflow-x-auto border border-slate-100 rounded-2xl">
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead>
+                                <tr className="bg-slate-50 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100">
+                                  <th className="px-6 py-3.5">Équipe</th>
+                                  <th className="px-6 py-3.5 text-center">Effectif</th>
+                                  <th className="px-6 py-3.5 text-center">Fiches Assignées</th>
+                                  <th className="px-6 py-3.5 text-center">Consultées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Traitées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Non-Traitées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Qualifiées (Taux)</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                                {teamsData.map((team, idx) => (
+                                  <tr key={idx} className="hover:bg-slate-50/50">
+                                    <td className="px-6 py-3.5">
+                                      <div className="flex items-center gap-2">
+                                        <div className="w-2 h-2 rounded-full bg-blue-600" />
+                                        <span className="font-extrabold text-slate-900 text-sm">{team.teamName}</span>
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center font-mono text-slate-500">
+                                      {team.agentsCount} agents
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center font-mono text-slate-800 font-bold">
+                                      {team.totalLeads} fiches
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center">
+                                      <div className="flex flex-col items-center">
+                                        <span className="text-blue-600 font-extrabold text-sm">{team.consultedRate}%</span>
+                                        <span className="text-[9px] text-slate-400 font-bold">({team.consulted}/{team.totalLeads})</span>
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center">
+                                      <div className="flex flex-col items-center">
+                                        <span className="text-emerald-600 font-extrabold text-sm">{team.treatedRate}%</span>
+                                        <span className="text-[9px] text-slate-400 font-bold">({team.treated}/{team.totalLeads})</span>
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center">
+                                      <div className="flex flex-col items-center">
+                                        <span className="text-rose-500 font-extrabold text-sm">{team.untreatedRate}%</span>
+                                        <span className="text-[9px] text-slate-400 font-bold">({team.untreated}/{team.totalLeads})</span>
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-3.5 text-center">
+                                      <div className="flex flex-col items-center">
+                                        <span className="text-indigo-600 font-extrabold text-sm">{team.qualifiedRate}%</span>
+                                        <span className="text-[9px] text-slate-400 font-bold">({team.qualified}/{team.totalLeads})</span>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ))}
+                                {teamsData.length === 0 && (
+                                  <tr>
+                                    <td colSpan={7} className="text-center py-8 text-slate-400 italic">
+                                      Aucune équipe enregistrée pour le moment.
+                                    </td>
+                                  </tr>
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+
+                        {/* 📊 ANALYSE INDIVIDUELLE DES CONSEILLERS ET LEURS TAUX DE CONSULTATION */}
+                        <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4">
+                          <div>
+                            <h2 className="text-lg font-bold text-slate-900">Performance Individuelle par Conseiller</h2>
+                            <p className="text-xs text-slate-400 font-semibold mt-0.5">Suivez l'activité de chaque agent : taux de fiches consultées/ouvertes et taux de fiches traitées par rapport à celles restées non traitées.</p>
+                          </div>
+                          
+                          <div className="overflow-x-auto border border-slate-100 rounded-2xl">
+                            <table className="w-full text-left border-collapse text-xs">
+                              <thead>
+                                <tr className="bg-slate-50 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100">
+                                  <th className="px-6 py-3.5">Conseiller</th>
+                                  <th className="px-6 py-3.5 text-center">Équipe</th>
+                                  <th className="px-6 py-3.5 text-center">Fiches Assignées</th>
+                                  <th className="px-6 py-3.5 text-center">Consultées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Traitées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Non-Traitées (Taux)</th>
+                                  <th className="px-6 py-3.5 text-center">Taux Qualif</th>
+                                  <th className="px-6 py-3.5 text-center">Temps de Qualif Moyen</th>
+                                  <th className="px-6 py-3.5 text-center">Présence / Pause</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                                {(() => {
+                                  const perfAgents = agents.filter(agent => {
+                                    if (perfAgentFilter !== 'all' && agent.id !== perfAgentFilter) return false;
+                                    if (perfTeamFilter !== 'all') {
+                                      const teamName = agent.team || 'Sans Équipe';
+                                      if (teamName !== perfTeamFilter) return false;
+                                    }
+                                    return true;
+                                  });
+
+                                  if (perfAgents.length === 0) {
+                                    return (
+                                      <tr>
+                                        <td colSpan={9} className="text-center py-8 text-slate-400 italic">
+                                          Aucun conseiller correspondant aux critères de filtrage.
+                                        </td>
+                                      </tr>
+                                    );
+                                  }
+
+                                  return perfAgents.map((agent) => {
+                                    const agentLeads = perfLeads.filter(l => l.assignedAgentId === agent.id);
+                                    const qLeads = agentLeads.filter(l => l.status === 'qualified');
+                                    
+                                    let agentTotalMins = 0;
+                                    let agentCounted = 0;
+                                    qLeads.forEach(lead => {
+                                      const mins = getQualMinutes(lead);
+                                      if (mins !== null) {
+                                        agentTotalMins += mins;
+                                        agentCounted++;
+                                      }
+                                    });
+
+                                    const agentAvgMins = agentCounted > 0 ? Math.round(agentTotalMins / agentCounted) : 0;
+                                    const convRate = agentLeads.length > 0 ? Math.round((qLeads.length / agentLeads.length) * 100) : 0;
+
+                                    // Consultation, treated and untreated metrics for the agent
+                                    const totalLeads = agentLeads.length;
+                                    const consulted = agentLeads.filter(l => 
+                                      l.consultedBy && l.consultedBy.some(c => c.agentEmail === agent.email)
+                                    ).length;
+                                    const treated = agentLeads.filter(l => l.status !== 'new').length;
+                                    const untreated = agentLeads.filter(l => l.status === 'new').length;
+
+                                    const consultedRate = totalLeads > 0 ? Math.round((consulted / totalLeads) * 100) : 0;
+                                    const treatedRate = totalLeads > 0 ? Math.round((treated / totalLeads) * 100) : 0;
+                                    const untreatedRate = totalLeads > 0 ? Math.round((untreated / totalLeads) * 100) : 0;
+
+                                    // Calculate presence
+                                    const logs = perfPresenceLogs.filter(log => log.email.toLowerCase() === agent.email.toLowerCase());
+                                    let onlineTotalMins = 0;
+                                    let breakTotalMins = 0;
+
+                                    logs.forEach(l => {
+                                      const duration = l.durationMinutes || 0;
+                                      if (l.status === 'en_ligne') {
+                                        onlineTotalMins += duration;
+                                      } else if (l.status === 'en_pause') {
+                                        breakTotalMins += duration;
+                                      }
+                                    });
+
+                                    return (
+                                      <tr key={agent.id} className="hover:bg-slate-50/50">
+                                        <td className="px-6 py-3.5">
+                                          <p className="font-bold text-slate-900">{agent.name}</p>
+                                          <p className="text-[10px] text-slate-400 font-semibold">{agent.email}</p>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center font-semibold text-slate-500">
+                                          <span className="px-2 py-0.5 rounded-full bg-slate-50 text-[10px] border border-slate-100">
+                                            {agent.team || 'Sans Équipe'}
+                                          </span>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center font-mono font-bold text-slate-800">
+                                          {totalLeads} fiches
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center">
+                                          <div className="flex flex-col items-center">
+                                            <span className="text-blue-600 font-extrabold">{consultedRate}%</span>
+                                            <span className="text-[9px] text-slate-400 font-bold">({consulted}/{totalLeads})</span>
+                                          </div>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center">
+                                          <div className="flex flex-col items-center">
+                                            <span className="text-emerald-600 font-extrabold">{treatedRate}%</span>
+                                            <span className="text-[9px] text-slate-400 font-bold">({treated}/{totalLeads})</span>
+                                          </div>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center">
+                                          <div className="flex flex-col items-center">
+                                            <span className="text-rose-500 font-extrabold">{untreatedRate}%</span>
+                                            <span className="text-[9px] text-slate-400 font-bold">({untreated}/{totalLeads})</span>
+                                          </div>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center">
+                                          <span className={`px-2 py-1 rounded-full text-[10px] font-extrabold border ${
+                                            convRate >= 40 
+                                              ? 'bg-emerald-50 text-emerald-700 border-emerald-100' 
+                                              : convRate >= 20
+                                              ? 'bg-blue-50 text-blue-700 border-blue-100'
+                                              : 'bg-slate-50 text-slate-600 border-slate-100'
+                                          }`}>
+                                            {convRate}%
+                                          </span>
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center font-mono font-bold text-slate-800">
+                                          {formatMinToHuman(agentAvgMins)}
+                                        </td>
+                                        <td className="px-6 py-3.5 text-center text-[10px] font-bold text-slate-600">
+                                          <div className="flex flex-col items-center gap-0.5">
+                                            <span className="text-emerald-600">Pres: {onlineTotalMins > 0 ? `${Math.floor(onlineTotalMins / 60)}h ${onlineTotalMins % 60}m` : '0m'}</span>
+                                            <span className="text-amber-600">Pause: {breakTotalMins > 0 ? `${Math.floor(breakTotalMins / 60)}h ${breakTotalMins % 60}m` : '0m'}</span>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    );
+                                  });
+                                })()}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </>
+                    );
+                  })()}
+
+                  {/* Individual Qualified Leads list with detailed timing */}
+                  <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4">
+                    <h2 className="text-lg font-bold text-slate-900">Suivi du Temps de Qualification par Fiche</h2>
+                    
+                    <div className="overflow-x-auto border border-slate-100 rounded-2xl">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="bg-slate-50 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100">
+                            <th className="px-6 py-3.5">Fiche Client</th>
+                            <th className="px-6 py-3.5">Conseiller Assigné</th>
+                            <th className="px-6 py-3.5">Heure Création</th>
+                            <th className="px-6 py-3.5">Heure Qualification</th>
+                            <th className="px-6 py-3.5">Temps de qualification</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                          {qualifiedLeads.length === 0 ? (
+                            <tr>
+                              <td colSpan={5} className="text-center py-8 text-slate-400 italic">
+                                Aucun lead qualifié pour le moment.
+                              </td>
+                            </tr>
+                          ) : (
+                            qualifiedLeads.map((lead) => {
+                              const qMins = getQualMinutes(lead);
+                              
+                              return (
+                                <tr key={lead.id} className="hover:bg-slate-50/50">
+                                  <td className="px-6 py-3.5">
+                                    <p className="font-bold text-slate-900">{lead.name}</p>
+                                    <p className="text-[10px] text-slate-400 font-semibold">{lead.company || 'Aucune entreprise'}</p>
+                                  </td>
+                                  <td className="px-6 py-3.5 text-slate-800">
+                                    {lead.assignedAgentName || 'Non assigné'}
+                                  </td>
+                                  <td className="px-6 py-3.5 font-mono text-slate-500">
+                                    {new Date(lead.createdAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                                  </td>
+                                  <td className="px-6 py-3.5 font-mono text-slate-500">
+                                    {new Date(lead.updatedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                                  </td>
+                                  <td className="px-6 py-3.5 font-mono font-bold text-emerald-600">
+                                    {formatMinToHuman(qMins || 0)}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </div>
         )}
       </main>
@@ -2174,6 +3883,33 @@ export default function AdminDashboard({
                 />
               </div>
 
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Rôle / Accès d'Équipe</label>
+                <select 
+                  className="input-field bg-white"
+                  value={newAgent.role}
+                  onChange={(e) => setNewAgent({...newAgent, role: e.target.value as UserRole})}
+                >
+                  <option value="agent">Conseiller commercial (Agent)</option>
+                  <option value="supervisor">Superviseur d'Équipe (Supervisor)</option>
+                  <option value="manager">Manager CRM (Manager)</option>
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Équipe d'Appartenance (Optionnel)</label>
+                <select 
+                  className="input-field bg-white"
+                  value={newAgent.team}
+                  onChange={(e) => setNewAgent({...newAgent, team: e.target.value})}
+                >
+                  <option value="">Sans Équipe (Aucune)</option>
+                  {teams.map(team => (
+                    <option key={team.id} value={team.name}>{team.name}</option>
+                  ))}
+                </select>
+              </div>
+
               <div className="flex gap-4 pt-4">
                 <button 
                   type="button"
@@ -2236,12 +3972,280 @@ export default function AdminDashboard({
                 />
               </div>
 
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Rôle / Accès d'Équipe</label>
+                <select 
+                  className="input-field bg-white"
+                  value={selectedAgent.role || 'agent'}
+                  onChange={(e) => setSelectedAgent({...selectedAgent, role: e.target.value as UserRole})}
+                >
+                  <option value="agent">Conseiller commercial (Agent)</option>
+                  <option value="supervisor">Superviseur d'Équipe (Supervisor)</option>
+                  <option value="manager">Manager CRM (Manager)</option>
+                </select>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Équipe d'Appartenance</label>
+                <select 
+                  className="input-field bg-white"
+                  value={selectedAgent.team || ''}
+                  onChange={(e) => setSelectedAgent({...selectedAgent, team: e.target.value})}
+                >
+                  <option value="">Sans Équipe (Aucune)</option>
+                  {teams.map(team => (
+                    <option key={team.id} value={team.name}>{team.name}</option>
+                  ))}
+                </select>
+              </div>
+
               <div className="flex gap-4 pt-4">
                 <button 
                   type="button"
                   onClick={() => {
                     setShowEditAgentModal(false);
                     setSelectedAgent(null);
+                  }}
+                  className="flex-1 py-3 text-slate-400 hover:bg-slate-100 rounded-xl text-sm font-bold transition-all"
+                >
+                  Annuler
+                </button>
+                <button type="submit" className="flex-1 btn-primary py-3 text-sm font-bold">
+                  Sauvegarder
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+
+      {/* ADD TEAM MODAL */}
+      {showAddTeamModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <motion.div 
+            initial={{ opacity: 0, y: 10, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="bg-white rounded-3xl p-8 max-w-lg w-full shadow-2xl relative"
+          >
+            <button 
+              onClick={() => setShowAddTeamModal(false)}
+              className="absolute right-6 top-6 p-2 text-slate-400 hover:bg-slate-100 rounded-full transition-all"
+            >
+              <X size={20} />
+            </button>
+            <h3 className="text-2xl font-bold text-slate-900 mb-2 font-display">Créer un Nouveau Projet / Équipe</h3>
+            <p className="text-slate-500 mb-6 text-sm">
+              Créez une équipe commerciale et associez un ou plusieurs superviseurs et managers.
+            </p>
+
+            <form onSubmit={handleCreateTeam} className="space-y-5">
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Nom du Projet / Équipe</label>
+                <input 
+                  type="text" 
+                  required
+                  placeholder="ex: Projet Énergie France"
+                  className="input-field"
+                  value={newTeam.name}
+                  onChange={(e) => setNewTeam({...newTeam, name: e.target.value})}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">Superviseurs Assignés (Plusieurs possibles)</label>
+                <div className="border border-slate-200 rounded-xl p-3.5 space-y-2 max-h-32 overflow-y-auto bg-slate-50/50">
+                  {rawAgents.filter(a => a.role === 'supervisor').map(agent => {
+                    const isChecked = newTeam.supervisorIds?.includes(agent.email);
+                    return (
+                      <label key={agent.id} className="flex items-center gap-2.5 text-sm font-medium text-slate-700 cursor-pointer select-none hover:text-indigo-600 transition-colors">
+                        <input 
+                          type="checkbox"
+                          className="rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 w-4 h-4"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            let updated = [...(newTeam.supervisorIds || [])];
+                            if (e.target.checked) {
+                              updated.push(agent.email);
+                            } else {
+                              updated = updated.filter(email => email !== agent.email);
+                            }
+                            setNewTeam({
+                              ...newTeam,
+                              supervisorIds: updated,
+                              supervisorId: updated[0] || ''
+                            });
+                          }}
+                        />
+                        <span>{agent.name} <span className="text-xs text-slate-400 font-normal">({agent.email})</span></span>
+                      </label>
+                    );
+                  })}
+                  {rawAgents.filter(a => a.role === 'supervisor').length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Aucun superviseur disponible. Créez un compte superviseur d'abord.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">Managers de Projet Assignés (Plusieurs possibles)</label>
+                <div className="border border-slate-200 rounded-xl p-3.5 space-y-2 max-h-32 overflow-y-auto bg-slate-50/50">
+                  {rawAgents.filter(a => a.role === 'manager').map(agent => {
+                    const isChecked = newTeam.managerIds?.includes(agent.email);
+                    return (
+                      <label key={agent.id} className="flex items-center gap-2.5 text-sm font-medium text-slate-700 cursor-pointer select-none hover:text-emerald-600 transition-colors">
+                        <input 
+                          type="checkbox"
+                          className="rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 w-4 h-4"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            let updated = [...(newTeam.managerIds || [])];
+                            if (e.target.checked) {
+                              updated.push(agent.email);
+                            } else {
+                              updated = updated.filter(email => email !== agent.email);
+                            }
+                            setNewTeam({
+                              ...newTeam,
+                              managerIds: updated
+                            });
+                          }}
+                        />
+                        <span>{agent.name} <span className="text-xs text-slate-400 font-normal">({agent.email})</span></span>
+                      </label>
+                    );
+                  })}
+                  {rawAgents.filter(a => a.role === 'manager').length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Aucun manager disponible. Créez un compte manager d'abord.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  type="button"
+                  onClick={() => setShowAddTeamModal(false)}
+                  className="flex-1 py-3 text-slate-500 hover:bg-slate-100 rounded-xl text-sm font-bold transition-all"
+                >
+                  Annuler
+                </button>
+                <button type="submit" className="flex-1 btn-primary py-3 text-sm font-bold">
+                  Créer l'équipe
+                </button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+
+      {/* EDIT TEAM MODAL */}
+      {showEditTeamModal && selectedTeam && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <motion.div 
+            initial={{ opacity: 0, y: 10, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="bg-white rounded-3xl p-8 max-w-lg w-full shadow-2xl relative"
+          >
+            <button 
+              onClick={() => {
+                setShowEditTeamModal(false);
+                setSelectedTeam(null);
+              }}
+              className="absolute right-6 top-6 p-2 text-slate-400 hover:bg-slate-100 rounded-full transition-all"
+            >
+              <X size={20} />
+            </button>
+            <h3 className="text-2xl font-bold text-slate-900 mb-2">Modifier l'Équipe / Projet</h3>
+            <p className="text-slate-500 mb-6 text-sm">
+              Mettez à jour les informations, superviseurs et managers affectés au projet.
+            </p>
+
+            <form onSubmit={handleEditTeamSubmit} className="space-y-5">
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider">Nom de l'Équipe</label>
+                <input 
+                  type="text" 
+                  required
+                  className="input-field"
+                  value={selectedTeam.name}
+                  onChange={(e) => setSelectedTeam({...selectedTeam, name: e.target.value})}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">Superviseurs Assignés (Plusieurs possibles)</label>
+                <div className="border border-slate-200 rounded-xl p-3.5 space-y-2 max-h-32 overflow-y-auto bg-slate-50/50">
+                  {rawAgents.filter(a => a.role === 'supervisor').map(agent => {
+                    const isChecked = selectedTeam.supervisorIds?.includes(agent.email) || selectedTeam.supervisorId === agent.email;
+                    return (
+                      <label key={agent.id} className="flex items-center gap-2.5 text-sm font-medium text-slate-700 cursor-pointer select-none hover:text-indigo-600 transition-colors">
+                        <input 
+                          type="checkbox"
+                          className="rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 w-4 h-4"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            let updated = [...(selectedTeam.supervisorIds || [])];
+                            if (e.target.checked) {
+                              if (!updated.includes(agent.email)) updated.push(agent.email);
+                            } else {
+                              updated = updated.filter(email => email !== agent.email);
+                            }
+                            setSelectedTeam({
+                              ...selectedTeam,
+                              supervisorIds: updated,
+                              supervisorId: updated[0] || ''
+                            });
+                          }}
+                        />
+                        <span>{agent.name} <span className="text-xs text-slate-400 font-normal">({agent.email})</span></span>
+                      </label>
+                    );
+                  })}
+                  {rawAgents.filter(a => a.role === 'supervisor').length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Aucun superviseur disponible. Créez un compte superviseur d'abord.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block">Managers de Projet Assignés (Plusieurs possibles)</label>
+                <div className="border border-slate-200 rounded-xl p-3.5 space-y-2 max-h-32 overflow-y-auto bg-slate-50/50">
+                  {rawAgents.filter(a => a.role === 'manager').map(agent => {
+                    const isChecked = selectedTeam.managerIds?.includes(agent.email);
+                    return (
+                      <label key={agent.id} className="flex items-center gap-2.5 text-sm font-medium text-slate-700 cursor-pointer select-none hover:text-emerald-600 transition-colors">
+                        <input 
+                          type="checkbox"
+                          className="rounded text-emerald-600 focus:ring-emerald-500 border-slate-300 w-4 h-4"
+                          checked={isChecked}
+                          onChange={(e) => {
+                            let updated = [...(selectedTeam.managerIds || [])];
+                            if (e.target.checked) {
+                              if (!updated.includes(agent.email)) updated.push(agent.email);
+                            } else {
+                              updated = updated.filter(email => email !== agent.email);
+                            }
+                            setSelectedTeam({
+                              ...selectedTeam,
+                              managerIds: updated
+                            });
+                          }}
+                        />
+                        <span>{agent.name} <span className="text-xs text-slate-400 font-normal">({agent.email})</span></span>
+                      </label>
+                    );
+                  })}
+                  {rawAgents.filter(a => a.role === 'manager').length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Aucun manager disponible. Créez un compte manager d'abord.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex gap-4 pt-4">
+                <button 
+                  type="button"
+                  onClick={() => {
+                    setShowEditTeamModal(false);
+                    setSelectedTeam(null);
                   }}
                   className="flex-1 py-3 text-slate-400 hover:bg-slate-100 rounded-xl text-sm font-bold transition-all"
                 >

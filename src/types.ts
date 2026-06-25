@@ -3,13 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export type UserRole = 'admin' | 'agent';
+export type UserRole = 'admin' | 'agent' | 'supervisor' | 'manager';
 
 export interface User {
   email: string;
   role: UserRole;
   name: string;
   password?: string;
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  supervisorId?: string; // sanitized email/ID of the supervisor
+  supervisorIds?: string[]; // Multiple supervisors
+  managerIds?: string[]; // Multiple managers affected to this project
+  createdAt: string;
 }
 
 export interface AgentAccount {
@@ -19,6 +28,8 @@ export interface AgentAccount {
   password?: string;
   isActive: boolean;
   assignedLeadsCount?: number;
+  team?: string;
+  role?: UserRole;
 }
 
 export type LeadStatus = 'new' | 'in_progress' | 'qualified' | 'lost';
@@ -46,6 +57,7 @@ export interface LeadConsultation {
   agentName: string;
   agentEmail?: string;
   date: string;
+  durationSeconds?: number;
 }
 
 export interface Lead {

@@ -21,7 +21,7 @@ import { seedDatabase } from './lib/seed';
 import Login from './components/Login';
 import TestPlatform from './components/TestPlatform'; // Repurposed as AgentWorkspace
 import AdminDashboard from './components/AdminDashboard';
-import { User, Lead, AgentAccount, SystemNotification, CRMConfig } from './types';
+import { User, Lead, AgentAccount, SystemNotification, CRMConfig, Team } from './types';
 import { triggerAppsScriptEvent } from './lib/googleAppsScript';
 
 export default function App() {
@@ -29,6 +29,7 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [agents, setAgents] = useState<AgentAccount[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
   const [notifications, setNotifications] = useState<SystemNotification[]>([]);
   const [sheetConfig, setSheetConfig] = useState<CRMConfig>(() => {
     const cached = localStorage.getItem('crm_sheet_config');
@@ -44,6 +45,73 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [lastSync, setLastSync] = useState<Date | null>(null);
   const [impersonatedAgentId, setImpersonatedAgentId] = useState<string | null>(null);
+  const [onlineUsers, setOnlineUsers] = useState<any[]>([]);
+  const [presenceLogs, setPresenceLogs] = useState<any[]>([]);
+
+  // User Presence Tracking
+  useEffect(() => {
+    if (!currentUser) return;
+
+    // Set initial presence status as 'en_ligne' when logging in
+    const startPresence = async () => {
+      const { transitionPresence } = await import('./lib/presence');
+      await transitionPresence(currentUser.email, currentUser.name, currentUser.role, 'en_ligne');
+    };
+    
+    startPresence();
+
+    // Heartbeat every 20 seconds to keep connection doc updated
+    const interval = setInterval(async () => {
+      const { sendHeartbeat } = await import('./lib/presence');
+      // Retrieve the current user's actual status from the latest list, or default to 'en_ligne'
+      const myConn = onlineUsers.find(u => u.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim());
+      const currentStatus = myConn?.status || 'en_ligne';
+      
+      await sendHeartbeat(currentUser.email, currentUser.name, currentUser.role, currentStatus);
+    }, 20000);
+
+    const handleUnload = () => {
+      const sanitizedEmail = currentUser.email.toLowerCase().trim().replace(/[^a-z0-9]/g, '_');
+      deleteDoc(doc(db, 'connections', sanitizedEmail)).catch(() => {});
+    };
+
+    window.addEventListener('beforeunload', handleUnload);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeunload', handleUnload);
+    };
+  }, [currentUser, onlineUsers.length]);
+
+  // Listen to active connections
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const unsub = onSnapshot(collection(db, 'connections'), (snapshot) => {
+      const data = snapshot.docs.map(doc => doc.data());
+      setOnlineUsers(data);
+    }, (err) => {
+      console.error("Failed to fetch connections", err);
+    });
+
+    return () => unsub();
+  }, [currentUser]);
+
+  // Listen to chronological presence logs
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const unsub = onSnapshot(collection(db, 'presence_logs'), (snapshot) => {
+      const data = snapshot.docs.map(doc => doc.data());
+      // Sort newest logs first
+      data.sort((a, b) => new Date(b.endedAt).getTime() - new Date(a.endedAt).getTime());
+      setPresenceLogs(data);
+    }, (err) => {
+      console.error("Failed to fetch presence logs", err);
+    });
+
+    return () => unsub();
+  }, [currentUser]);
 
   // Authentication monitoring
   useEffect(() => {
@@ -76,7 +144,7 @@ export default function App() {
               if (agentData && agentData.isActive !== false) {
                  setCurrentUser({
                    email: agentData.email,
-                   role: 'agent',
+                   role: agentData.role || 'agent',
                    name: agentData.name
                  });
               } else {
@@ -90,19 +158,57 @@ export default function App() {
           const isAdmin = user.email === 'e.rodlish@gmail.com' || 
                           user.email === 'admin@ted-company.com';
           
-          setCurrentUser({
-            email: user.email!,
-            role: isAdmin ? 'admin' : 'agent',
-            name: user.displayName || (isAdmin ? 'Administrateur' : 'Conseiller CRM')
-          });
-
           if (isAdmin) {
+            setCurrentUser({
+              email: user.email!,
+              role: 'admin',
+              name: user.displayName || 'Administrateur'
+            });
             seedDatabase();
+          } else {
+            // Non-admin email-authenticated user, fetch role from candidates
+            const trimmedEmail = user.email!.toLowerCase().trim();
+            const sanitizedId = trimmedEmail.replace(/[^a-z0-9]/g, '_');
+            getDoc(doc(db, 'candidates', sanitizedId)).then(async (docSnap) => {
+              let agentData: AgentAccount | null = null;
+              if (docSnap.exists()) {
+                agentData = docSnap.data() as AgentAccount;
+              } else {
+                try {
+                  const q = query(collection(db, 'candidates'), where('email', '==', trimmedEmail));
+                  const querySnap = await getDocs(q);
+                  if (!querySnap.empty) {
+                    agentData = querySnap.docs[0].data() as AgentAccount;
+                  }
+                } catch (err) {
+                  console.error('Error fetching persistent agent by field query:', err);
+                }
+              }
+
+              if (agentData) {
+                if (agentData.isActive === false) {
+                  signOut(auth);
+                  localStorage.removeItem('candidate_email');
+                  return;
+                }
+                setCurrentUser({
+                  email: agentData.email,
+                  role: agentData.role || 'agent',
+                  name: agentData.name
+                });
+              } else {
+                setCurrentUser({
+                  email: user.email!,
+                  role: 'agent',
+                  name: user.displayName || 'Conseiller CRM'
+                });
+              }
+            });
           }
         }
       } else {
         // Only clear if we don't have a local session manually set
-        setCurrentUser(prev => prev?.role === 'agent' ? prev : null);
+        setCurrentUser(prev => (prev?.role === 'agent' || prev?.role === 'supervisor' || prev?.role === 'manager') ? prev : null);
       }
       setLoading(false);
     });
@@ -115,6 +221,7 @@ export default function App() {
 
     let unsubLeads = () => {};
     let unsubAgents = () => {};
+    let unsubTeams = () => {};
     let unsubNotifications = () => {};
     let unsubConfig = () => {};
 
@@ -140,7 +247,15 @@ export default function App() {
       }
     });
 
-    if (currentUser.role === 'admin') {
+    // 2. Fetch Teams (accessible to everyone)
+    unsubTeams = onSnapshot(collection(db, 'teams'), (snapshot) => {
+      const data = snapshot.docs.map(doc => doc.data() as Team);
+      setTeams(data);
+    }, (err) => {
+      console.error("Failed to fetch teams", err);
+    });
+
+    if (currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.role === 'supervisor') {
       // Listen to all leads
       unsubLeads = onSnapshot(collection(db, 'leads'), (snapshot) => {
         const data = snapshot.docs.map(doc => doc.data() as Lead);
@@ -192,6 +307,7 @@ export default function App() {
     return () => {
       unsubLeads();
       unsubAgents();
+      unsubTeams();
       unsubNotifications();
       unsubConfig();
     };
@@ -200,6 +316,13 @@ export default function App() {
   // Handle logout
   const handleLogout = async () => {
     try {
+      if (currentUser) {
+        const { transitionPresence } = await import('./lib/presence');
+        await transitionPresence(currentUser.email, currentUser.name, currentUser.role, 'deconnecte');
+        
+        const sanitizedEmail = currentUser.email.toLowerCase().trim().replace(/[^a-z0-9]/g, '_');
+        await deleteDoc(doc(db, 'connections', sanitizedEmail)).catch(() => {});
+      }
       await signOut(auth);
       localStorage.removeItem('candidate_email');
       setCurrentUser(null);
@@ -263,6 +386,33 @@ export default function App() {
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `candidates/${updated.id}`);
+    }
+  };
+
+  // Team mutations
+  const handleAddTeam = async (team: Team) => {
+    try {
+      const sanitized = sanitizeForFirestore(team);
+      await setDoc(doc(db, 'teams', team.id), sanitized);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `teams/${team.id}`);
+    }
+  };
+
+  const handleUpdateTeam = async (updated: Team) => {
+    try {
+      const sanitized = sanitizeForFirestore(updated);
+      await setDoc(doc(db, 'teams', updated.id), sanitized, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `teams/${updated.id}`);
+    }
+  };
+
+  const handleDeleteTeam = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'teams', id));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `teams/${id}`);
     }
   };
 
@@ -379,7 +529,7 @@ export default function App() {
     return <Login onLogin={setCurrentUser} />;
   }
 
-  if (currentUser.role === 'admin') {
+  if (currentUser.role === 'admin' || currentUser.role === 'manager' || currentUser.role === 'supervisor') {
     const impersonatedAgent = impersonatedAgentId ? agents.find(a => a.id === impersonatedAgentId) : null;
     
     if (impersonatedAgent) {
@@ -394,17 +544,23 @@ export default function App() {
           lastSync={lastSync}
           onBackToAdmin={() => setImpersonatedAgentId(null)}
           sheetConfig={sheetConfig}
+          onlineUsers={onlineUsers}
+          presenceLogs={presenceLogs}
         />
       );
     }
 
     return (
       <AdminDashboard 
+        currentUser={currentUser}
         leads={leads}
         agents={agents}
+        teams={teams}
         notifications={notifications}
         sheetConfig={sheetConfig}
         lastSync={lastSync}
+        onlineUsers={onlineUsers}
+        presenceLogs={presenceLogs}
         onLogout={handleLogout}
         onAddLead={handleAddLead}
         onDeleteLead={handleDeleteLead}
@@ -412,6 +568,9 @@ export default function App() {
         onAddAgent={handleAddAgent}
         onDeleteAgent={handleDeleteAgent}
         onUpdateAgent={handleUpdateAgent}
+        onAddTeam={handleAddTeam}
+        onUpdateTeam={handleUpdateTeam}
+        onDeleteTeam={handleDeleteTeam}
         onUpdateSheetConfig={handleUpdateSheetConfig}
         onMarkNotificationRead={handleMarkNotificationRead}
         onClearNotifications={handleClearNotifications}
@@ -442,6 +601,8 @@ export default function App() {
       onMarkNotificationRead={handleMarkNotificationRead}
       lastSync={lastSync}
       sheetConfig={sheetConfig}
+      onlineUsers={onlineUsers}
+      presenceLogs={presenceLogs}
     />
   ) : null;
 }

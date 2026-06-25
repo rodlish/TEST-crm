@@ -34,6 +34,14 @@ service cloud.firestore {
     }
 
     // -------------------------------------------------------------------------
+    // TEAMS COLLECTION (Sales teams definitions)
+    // -------------------------------------------------------------------------
+    match /teams/{teamId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
     // LEADS COLLECTION (The main CRM pipeline)
     // -------------------------------------------------------------------------
     match /leads/{leadId} {
@@ -54,6 +62,22 @@ service cloud.firestore {
     // SETTINGS COLLECTION (Google Sheets configuration documents)
     // -------------------------------------------------------------------------
     match /settings/{settingId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // CONNECTIONS COLLECTION (User presence / active sessions)
+    // -------------------------------------------------------------------------
+    match /connections/{connectionId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // -------------------------------------------------------------------------
+    // PRESENCE LOGS COLLECTION (History of agent logins, pauses, and logouts)
+    // -------------------------------------------------------------------------
+    match /presence_logs/{logId} {
       allow read: if true;
       allow write: if true;
     }

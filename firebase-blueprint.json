@@ -42,6 +42,18 @@
         "email": { "type": "string", "format": "email" }
       },
       "required": ["uid", "email"]
+    },
+    "Team": {
+      "title": "Team",
+      "description": "Represents a sales team.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "supervisorId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "name", "createdAt"]
     }
   },
   "firestore": {
@@ -56,6 +68,10 @@
     "/admins/{adminId}": {
       "schema": "Admin",
       "description": "Registry of authorized admin users."
+    },
+    "/teams/{teamId}": {
+      "schema": "Team",
+      "description": "Collection of sales teams."
     }
   }
 }

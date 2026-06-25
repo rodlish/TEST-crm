@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, FormEvent, useEffect } from 'react';
+import { useState, FormEvent, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   LogOut, 
@@ -53,6 +53,8 @@ interface TestPlatformProps {
   lastSync: Date | null;
   onBackToAdmin?: () => void;
   sheetConfig?: CRMConfig;
+  onlineUsers?: any[];
+  presenceLogs?: any[];
 }
 
 export default function TestPlatform({ 
@@ -64,9 +66,16 @@ export default function TestPlatform({
   onMarkNotificationRead,
   lastSync,
   onBackToAdmin,
-  sheetConfig
+  sheetConfig,
+  onlineUsers = [],
+  presenceLogs = []
 }: TestPlatformProps) {
   const [searchTerm, setSearchTerm] = useState('');
+  const [activeTab, setActiveTab] = useState<'leads' | 'presence'>('leads');
+
+  const conn = (onlineUsers || []).find(u => u.email.toLowerCase().trim() === agent.email.toLowerCase().trim());
+  const currentStatus = conn?.status || 'en_ligne';
+
   const [searchType, setSearchType] = useState<'all' | 'date' | 'feedback' | 'phone' | 'id_client'>('all');
   const [activeStatus, setActiveStatus] = useState<LeadStatus | 'all'>('all');
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
@@ -78,13 +87,107 @@ export default function TestPlatform({
 
   const [originalLead, setOriginalLead] = useState<Lead | null>(null);
   const [isSaved, setIsSaved] = useState<boolean>(true);
+  const [hasJustSaved, setHasJustSaved] = useState<boolean>(false);
   const [dateWarning, setDateWarning] = useState<string | null>(null);
   const [recallAlert, setRecallAlert] = useState<Lead | null>(null);
   const [isDateValidated, setIsDateValidated] = useState<boolean>(true);
 
+  const isQualifiedAndLocked = selectedLead 
+    ? (selectedLead.status === 'qualified' || selectedLead.status === 'lost' || hasJustSaved)
+    : false;
+
+  const handleStatusChange = async (newStatus: 'en_ligne' | 'en_pause' | 'deconnecte') => {
+    if (newStatus === 'en_pause' && !isSaved && selectedLead) {
+      alert("Veuillez d'abord enregistrer et qualifier la fiche actuelle avant de pouvoir vous mettre en pause !");
+      return;
+    }
+    const { transitionPresence } = await import('../lib/presence');
+    await transitionPresence(agent.email, agent.name, 'agent', newStatus);
+  };
+
   // States for tracking background Google Sheet synchronization
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [saveSuccessMessage, setSaveSuccessMessage] = useState<string | null>(null);
+
+  // Track active lead consultation session
+  const leadsRef = useRef(leads);
+  const agentRef = useRef(agent);
+  const activeLeadSessionRef = useRef<{ leadId: string; startTime: number } | null>(null);
+
+  useEffect(() => {
+    leadsRef.current = leads;
+    agentRef.current = agent;
+  }, [leads, agent]);
+
+  useEffect(() => {
+    // If there was a previous lead session active, save its duration
+    if (activeLeadSessionRef.current) {
+      const prevSession = activeLeadSessionRef.current;
+      const durationSeconds = Math.round((Date.now() - prevSession.startTime) / 1000);
+      
+      if (durationSeconds > 0) {
+        const prevLead = leadsRef.current.find(l => l.id === prevSession.leadId);
+        if (prevLead) {
+          const recentConsultations = [...(prevLead.consultedBy || [])];
+          const myLastConsultIdx = recentConsultations.findIndex(c => c.agentEmail === agentRef.current.email);
+          if (myLastConsultIdx !== -1) {
+            recentConsultations[myLastConsultIdx] = {
+              ...recentConsultations[myLastConsultIdx],
+              durationSeconds: (recentConsultations[myLastConsultIdx].durationSeconds || 0) + durationSeconds
+            };
+            onUpdateLead({
+              ...prevLead,
+              consultedBy: recentConsultations,
+              updatedAt: new Date().toISOString()
+            });
+          }
+        }
+      }
+    }
+
+    if (selectedLead) {
+      activeLeadSessionRef.current = {
+        leadId: selectedLead.id,
+        startTime: Date.now()
+      };
+    } else {
+      activeLeadSessionRef.current = null;
+    }
+  }, [selectedLead?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (activeLeadSessionRef.current) {
+        const prevSession = activeLeadSessionRef.current;
+        const durationSeconds = Math.round((Date.now() - prevSession.startTime) / 1000);
+        if (durationSeconds > 0) {
+          const prevLead = leadsRef.current.find(l => l.id === prevSession.leadId);
+          if (prevLead) {
+            const recentConsultations = [...(prevLead.consultedBy || [])];
+            const myLastConsultIdx = recentConsultations.findIndex(c => c.agentEmail === agentRef.current.email);
+            if (myLastConsultIdx !== -1) {
+              recentConsultations[myLastConsultIdx] = {
+                ...recentConsultations[myLastConsultIdx],
+                durationSeconds: (recentConsultations[myLastConsultIdx].durationSeconds || 0) + durationSeconds
+              };
+              onUpdateLead({
+                ...prevLead,
+                consultedBy: recentConsultations,
+                updatedAt: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+    };
+  }, []);
+
+  // Clear selected lead when agent goes on break
+  useEffect(() => {
+    if (currentStatus === 'en_pause' && selectedLead) {
+      setSelectedLead(null);
+    }
+  }, [currentStatus, selectedLead]);
 
   // Helper to format date with system timezoneOffset
   const formatDateToSystemOffset = (dateStr?: string | Date) => {
@@ -270,6 +373,11 @@ export default function TestPlatform({
   ];
 
   const handleSelectLead = (lead: Lead) => {
+    if (currentStatus === 'en_pause') {
+      alert("Vous êtes actuellement en pause. Veuillez repasser en statut actif pour consulter un dossier client.");
+      return;
+    }
+
     if (!isSaved && selectedLead) {
       const confirmLeave = window.confirm(
         "Vous avez des modifications non enregistrées sur ce dossier. Voulez-vous vraiment changer de dossier ? Vos modifications non sauvegardées seront perdues."
@@ -313,16 +421,23 @@ export default function TestPlatform({
         qualification: updatedLead.qualification ? { ...updatedLead.qualification } : {}
       });
       setIsSaved(true);
+      setHasJustSaved(false);
     } else {
       setOriginalLead({
         ...lead,
         qualification: lead.qualification ? { ...lead.qualification } : {}
       });
       setIsSaved(true);
+      setHasJustSaved(false);
     }
   };
 
   const handleFetchNextNewLead = () => {
+    if (currentStatus === 'en_pause') {
+      alert("Vous êtes actuellement en pause. Veuillez repasser en statut actif pour consulter un dossier client.");
+      return;
+    }
+
     if (!isSaved && selectedLead) {
       alert("Veuillez enregistrer vos modifications actuelles (ENREGISTRER) avant de passer au lead suivant !");
       return;
@@ -396,10 +511,11 @@ export default function TestPlatform({
     });
     // Set unsaved initially because they must qualify the lead at least once before requesting another one!
     setIsSaved(false);
+    setHasJustSaved(false);
   };
 
   const handleUpdateFeedbackStatus = (feedback: LeadFeedbackStatus) => {
-    if (!selectedLead) return;
+    if (!selectedLead || isQualifiedAndLocked) return;
 
     const updated: Lead = {
       ...selectedLead,
@@ -407,12 +523,18 @@ export default function TestPlatform({
       updatedAt: new Date().toISOString()
     };
 
+    if (feedback === 'confirmer' || feedback === 'refus') {
+      updated.callbackDate = '';
+      setIsDateValidated(true);
+      setDateWarning(null);
+    }
+
     setSelectedLead(updated);
     setIsSaved(false);
   };
 
   const handleSeparateRecallChange = (newDateVal: string, newTimeVal: string) => {
-    if (!selectedLead) return;
+    if (!selectedLead || isQualifiedAndLocked) return;
 
     if (!newDateVal && !newTimeVal) {
       setSelectedLead({
@@ -649,6 +771,7 @@ export default function TestPlatform({
           qualification: dueRecall.qualification ? { ...dueRecall.qualification } : {}
         });
         setIsSaved(true);
+        setHasJustSaved(false);
         setHistoryNote('');
         setRecallAlert(dueRecall);
       } else {
@@ -658,6 +781,7 @@ export default function TestPlatform({
           qualification: updated.qualification ? { ...updated.qualification } : {}
         });
         setIsSaved(true);
+        setHasJustSaved(true);
         setHistoryNote('');
       }
       
@@ -674,7 +798,7 @@ export default function TestPlatform({
   };
 
   const handleUpdateStatus = (status: LeadStatus) => {
-    if (!selectedLead) return;
+    if (!selectedLead || isQualifiedAndLocked) return;
 
     const updated: Lead = {
       ...selectedLead,
@@ -682,12 +806,18 @@ export default function TestPlatform({
       updatedAt: new Date().toISOString()
     };
 
+    if (status === 'qualified' || status === 'lost') {
+      updated.callbackDate = '';
+      setIsDateValidated(true);
+      setDateWarning(null);
+    }
+
     setSelectedLead(updated);
     setIsSaved(false);
   };
 
   const handleUpdateQualification = (field: string, value: any) => {
-    if (!selectedLead) return;
+    if (!selectedLead || isQualifiedAndLocked) return;
 
     const newQual = {
       ...selectedLead.qualification,
@@ -744,17 +874,29 @@ export default function TestPlatform({
             alt="TED Logo" 
             className="h-8 brightness-0 invert"
           />
-          <div className="border-l border-white/20 pl-3 hidden sm:block">
-            <span className="text-xs uppercase font-bold text-slate-400 tracking-widest block">Compte Agent</span>
-            <span className="text-sm font-bold block">{agent.name}</span>
+          <div className="border-l border-white/20 pl-3">
+            <span className="text-[10px] uppercase font-bold text-slate-400 tracking-widest block">Agent • {agent.name}</span>
+            <div className="mt-1 flex items-center gap-1.5">
+              <span className={`h-2 w-2 rounded-full animate-pulse ${
+                currentStatus === 'en_ligne' ? 'bg-emerald-400' : currentStatus === 'en_pause' ? 'bg-amber-400' : 'bg-slate-400'
+              }`}></span>
+              <select
+                value={currentStatus}
+                onChange={(e) => handleStatusChange(e.target.value as any)}
+                className="bg-transparent hover:bg-white/10 border-none rounded text-xs font-bold text-white py-0 px-1.5 outline-none cursor-pointer focus:ring-0"
+              >
+                <option value="en_ligne" className="text-slate-800">🟢 Activité (En ligne)</option>
+                <option value="en_pause" className="text-slate-800">🟠 En Pause</option>
+              </select>
+            </div>
           </div>
         </div>
 
         <div className="flex items-center gap-6">
           <button
             onClick={handleFetchNextNewLead}
-            disabled={!isSaved && !!selectedLead}
-            title={!isSaved && selectedLead ? "Veuillez enregistrer votre qualification actuelle (ENREGISTRER) avant de passer au lead suivant !" : "Consulter le dossier Nouveau suivant"}
+            disabled={(!isSaved && !!selectedLead) || currentStatus === 'en_pause'}
+            title={currentStatus === 'en_pause' ? "Vous êtes en pause. Repassez en statut actif pour pouvoir passer au dossier suivant." : (!isSaved && selectedLead ? "Veuillez enregistrer votre qualification actuelle (ENREGISTRER) avant de passer au lead suivant !" : "Consulter le dossier Nouveau suivant")}
             className="flex items-center gap-1.5 px-4.5 py-2 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-extrabold text-sm rounded-xl transition-all shadow-md shadow-emerald-900/10 border border-emerald-500 cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed disabled:bg-slate-400 disabled:border-slate-300 disabled:scale-100"
           >
             <ArrowRight size={16} />
@@ -795,8 +937,29 @@ export default function TestPlatform({
         </div>
       )}
 
-      {/* Main CRM area */}
-      <div className="flex-1 max-w-7xl mx-auto w-full p-6 md:p-12 grid grid-cols-1 lg:grid-cols-3 gap-8">
+      {/* Tab Switcher Bar for Agent */}
+      <div className="max-w-7xl mx-auto w-full px-6 md:px-12 pt-6 flex border-b border-slate-200 gap-6">
+        <button
+          onClick={() => setActiveTab('leads')}
+          className={`pb-3 text-sm font-extrabold transition-all border-b-2 cursor-pointer ${
+            activeTab === 'leads' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-900'
+          }`}
+        >
+          📁 Mes Fiches & Qualifications
+        </button>
+        <button
+          onClick={() => setActiveTab('presence')}
+          className={`pb-3 text-sm font-extrabold transition-all border-b-2 cursor-pointer ${
+            activeTab === 'presence' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-900'
+          }`}
+        >
+          ⏱️ Mon Suivi de Présence & Pauses
+        </button>
+      </div>
+
+      {activeTab === 'leads' ? (
+        /* Main CRM area */
+        <div className="flex-1 max-w-7xl mx-auto w-full p-6 md:p-12 grid grid-cols-1 lg:grid-cols-3 gap-8">
         
         {/* Left column: Assigned Leads pipeline */}
         <div className="lg:col-span-1 space-y-6">
@@ -970,11 +1133,12 @@ export default function TestPlatform({
                     <button
                       key={st}
                       onClick={() => handleUpdateStatus(st)}
+                      disabled={isQualifiedAndLocked}
                       className={`px-2.5 py-1 text-xs font-bold rounded border transition-all ${
                         selectedLead.status === st
                           ? getStatusColor(st)
                           : 'bg-white text-slate-300 border-slate-100 hover:border-slate-200'
-                      }`}
+                      } disabled:opacity-60 disabled:cursor-not-allowed`}
                     >
                       {getStatusLabel(st)}
                     </button>
@@ -1012,13 +1176,16 @@ export default function TestPlatform({
                   <button
                     type="button"
                     onClick={isEditingCorporate ? handleSaveCorporate : () => setIsEditingCorporate(true)}
+                    disabled={isQualifiedAndLocked}
                     className={`px-4 py-2 rounded-xl text-xs uppercase font-black tracking-widest border transition-all duration-200 cursor-pointer shadow-sm ${
-                      isEditingCorporate 
+                      isQualifiedAndLocked
+                        ? 'bg-slate-200 text-slate-400 border-slate-350 cursor-not-allowed opacity-60'
+                        : isEditingCorporate 
                         ? 'bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 shadow-md scale-[1.03] ring-2 ring-emerald-400 ring-offset-1' 
                         : 'bg-white hover:bg-slate-50 text-slate-650 border-slate-200 shadow-3xs'
                     }`}
                   >
-                    {isEditingCorporate ? '💾 ENREGISTRER' : '✏️ Modifier la Fiche'}
+                    {isQualifiedAndLocked ? '🔒 Modif. Bloquées' : (isEditingCorporate ? '💾 ENREGISTRER' : '✏️ Modifier la Fiche')}
                   </button>
                 </div>
 
@@ -1400,11 +1567,12 @@ export default function TestPlatform({
                       <button
                         key={fbKey}
                         onClick={() => handleUpdateFeedbackStatus(fbKey)}
+                        disabled={isQualifiedAndLocked}
                         className={`flex flex-col items-center justify-center p-3 rounded-xl border transition-all text-center group cursor-pointer ${
                           isSelected 
                             ? `${fb.color} ring-2 ring-indigo-500 scale-[1.02] shadow-sm font-black border-transparent`
                             : `bg-white text-slate-600 border-slate-200 ${fb.hoverColor} hover:border-slate-300`
-                        }`}
+                        } disabled:opacity-60 disabled:cursor-not-allowed`}
                         title={fb.desc}
                       >
                         <span className="text-lg mb-1">{fb.icon}</span>
@@ -1415,7 +1583,7 @@ export default function TestPlatform({
                 </div>
 
                 {/* Datetime Recall Selector (min prevents past dates/hours) */}
-                {selectedLead.feedbackStatus && (
+                {selectedLead.feedbackStatus && selectedLead.feedbackStatus !== 'confirmer' && selectedLead.feedbackStatus !== 'refus' && (
                   <motion.div 
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: 'auto' }}
@@ -1429,7 +1597,8 @@ export default function TestPlatform({
                       <div className="relative w-full sm:w-32 shrink-0">
                         <input
                           type="date"
-                          className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-bold text-slate-700 focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-3xs"
+                          disabled={isQualifiedAndLocked}
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-bold text-slate-700 focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-3xs disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                           value={getSystemLocalDateString(selectedLead.callbackDate)}
                           onClick={(e) => (e.target as HTMLInputElement).showPicker?.()}
                           onChange={(e) => handleSeparateRecallChange(e.target.value, getSystemLocalTimeString(selectedLead.callbackDate))}
@@ -1440,7 +1609,8 @@ export default function TestPlatform({
                       <div className="relative w-full sm:w-24 shrink-0">
                         <input
                           type="time"
-                          className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-bold text-slate-700 focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-3xs"
+                          disabled={isQualifiedAndLocked}
+                          className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-bold text-slate-700 focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-3xs disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                           value={getSystemLocalTimeString(selectedLead.callbackDate)}
                           onClick={(e) => (e.target as HTMLInputElement).showPicker?.()}
                           onChange={(e) => handleSeparateRecallChange(getSystemLocalDateString(selectedLead.callbackDate), e.target.value)}
@@ -1455,7 +1625,8 @@ export default function TestPlatform({
                             setIsDateValidated(true);
                             setDateWarning(null);
                           }}
-                          className="text-[10px] bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.8 rounded-lg font-black shrink-0 shadow-md cursor-pointer uppercase flex items-center gap-1 transition-all"
+                          disabled={isQualifiedAndLocked}
+                          className="text-[10px] bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.8 rounded-lg font-black shrink-0 shadow-md cursor-pointer uppercase flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           👌 OK
                         </button>
@@ -1477,7 +1648,8 @@ export default function TestPlatform({
                             setDateWarning(null);
                             setIsDateValidated(true);
                           }}
-                          className="text-[10px] bg-white border border-rose-200 text-rose-600 hover:bg-rose-50 px-2.5 py-1.8 rounded-lg font-bold shrink-0 shadow-3xs cursor-pointer flex items-center gap-1 transition-all"
+                          disabled={isQualifiedAndLocked}
+                          className="text-[10px] bg-white border border-rose-200 text-rose-600 hover:bg-rose-50 px-2.5 py-1.8 rounded-lg font-bold shrink-0 shadow-3xs cursor-pointer flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           ❌ Annuler relance
                         </button>
@@ -1510,9 +1682,10 @@ export default function TestPlatform({
                           <button
                             key={t}
                             onClick={() => handleUpdateQualification('temperature', t)}
+                            disabled={isQualifiedAndLocked}
                             className={`flex-1 py-1 text-[10px] font-black rounded border transition-all uppercase ${
                               selectedLead.qualification?.temperature === t ? getTempColor(t) : 'bg-white text-slate-300 border-slate-200'
-                            }`}
+                            } disabled:opacity-60 disabled:cursor-not-allowed`}
                           >
                             {t === 'cold' ? '❄️ Froid' : t === 'warm' ? '⚡ Tiède' : '🔥 Chaud'}
                           </button>
@@ -1528,9 +1701,10 @@ export default function TestPlatform({
                           <button
                             key={b}
                             onClick={() => handleUpdateQualification('budget', b)}
+                            disabled={isQualifiedAndLocked}
                             className={`flex-1 py-1 text-[10px] rounded border transition-all uppercase ${
                               selectedLead.qualification?.budget === b ? 'bg-blue-600 text-white border-blue-700 font-bold' : 'bg-white text-slate-400 border-slate-200'
-                            }`}
+                            } disabled:opacity-60 disabled:cursor-not-allowed`}
                           >
                             {b === 'low' ? 'Faible' : b === 'medium' ? 'Moyen' : 'Élevé'}
                           </button>
@@ -1546,9 +1720,10 @@ export default function TestPlatform({
                           <button
                             key={a}
                             onClick={() => handleUpdateQualification('authority', a)}
+                            disabled={isQualifiedAndLocked}
                             className={`flex-1 py-1 text-[9px] rounded border transition-all uppercase ${
                               selectedLead.qualification?.authority === a ? 'bg-blue-600 text-white border-blue-700 font-bold' : 'bg-white text-slate-400 border-slate-200'
-                            }`}
+                            } disabled:opacity-60 disabled:cursor-not-allowed`}
                           >
                             {a === 'none' ? 'Non' : a === 'influencer' ? 'Scolaire' : 'Direct'}
                           </button>
@@ -1560,9 +1735,10 @@ export default function TestPlatform({
                     <div className="space-y-1">
                       <span className="text-slate-400 font-bold">Besoin Défini</span>
                       <textarea
-                        className="w-full bg-white border border-slate-200 rounded-lg p-2 h-14 resize-none outline-none font-semibold text-slate-700 focus:ring-1 focus:ring-blue-500"
+                        className="w-full bg-white border border-slate-200 rounded-lg p-2 h-14 resize-none outline-none font-semibold text-slate-700 focus:ring-1 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         value={selectedLead.qualification?.need || ''}
                         onChange={(e) => handleUpdateQualification('need', e.target.value)}
+                        disabled={isQualifiedAndLocked}
                         placeholder="Quels sont les besoins exacts exprimés par le client..."
                       />
                     </div>
@@ -1572,9 +1748,10 @@ export default function TestPlatform({
                       <span className="text-slate-400 font-bold">Délai estimé signature</span>
                       <input
                         type="text"
-                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-semibold text-slate-700 focus:ring-1 focus:ring-blue-500"
+                        className="w-full bg-white border border-slate-200 rounded-lg p-2 text-xs outline-none font-semibold text-slate-700 focus:ring-1 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                         value={selectedLead.qualification?.timeline || ''}
                         onChange={(e) => handleUpdateQualification('timeline', e.target.value)}
+                        disabled={isQualifiedAndLocked}
                         placeholder="Ex: sous 3 semaines, immédiat..."
                       />
                     </div>
@@ -1594,23 +1771,30 @@ export default function TestPlatform({
                       </span>
                     </div>
 
-                    <textarea
-                      placeholder="Indiquez le résumé exact de la note..."
-                      className="w-full bg-white border border-slate-200 rounded-lg p-3 text-xs outline-none h-24 resize-none font-semibold focus:ring-1 focus:ring-blue-500"
+                     <textarea
+                      placeholder={isQualifiedAndLocked ? "Dossier qualifié et verrouillé. Aucune modification supplémentaire possible." : "Indiquez le résumé exact de la note..."}
+                      className="w-full bg-white border border-slate-200 rounded-lg p-3 text-xs outline-none h-24 resize-none font-semibold focus:ring-1 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                       value={historyNote}
                       onChange={(e) => setHistoryNote(e.target.value)}
+                      disabled={isQualifiedAndLocked}
                     />
 
                     <button 
                       type="submit" 
-                      disabled={!isDateValidated}
+                      disabled={isQualifiedAndLocked || !isDateValidated}
                       className={`w-full py-3 px-5 text-xs font-black tracking-widest uppercase transition-all duration-200 shadow-lg rounded-xl flex items-center justify-center gap-1.5 border ${
-                        isDateValidated 
+                        isQualifiedAndLocked
+                          ? 'bg-slate-200 text-slate-400 border-slate-300 cursor-not-allowed shadow-none'
+                          : isDateValidated 
                           ? 'bg-indigo-600 hover:bg-indigo-500 text-white active:scale-95 border-indigo-400 cursor-pointer' 
                           : 'bg-slate-300 text-slate-500 border-slate-300 opacity-75 cursor-not-allowed'
                       }`}
                     >
-                      {isDateValidated ? '💾 ENREGISTRER' : '⚠️ ENREGISTRER (VALIDER LA RELANCE AVEC OK D\'ABORD)'}
+                      {isQualifiedAndLocked 
+                        ? '💾 FICHE ENREGISTRÉE & QUALIFIÉE (MODIFICATION BLOQUÉE)' 
+                        : isDateValidated 
+                        ? '💾 ENREGISTRER' 
+                        : '⚠️ ENREGISTRER (VALIDER LA RELANCE AVEC OK D\'ABORD)'}
                     </button>
                   </div>
                 </form>
@@ -1678,14 +1862,216 @@ export default function TestPlatform({
             </motion.div>
           ) : (
             <div className="h-full min-h-[400px] border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center p-8 bg-white/70">
-              <Database size={64} className="text-slate-300 mb-4 animate-pulse" />
-              <h3 className="font-bold text-slate-400 text-lg">Aucun dossier prospect sélectionné</h3>
-              <p className="text-xs text-slate-300 mt-1 max-w-sm text-center">Cliquez sur l'un des leads dans l'onglet de gauche pour le qualification, qualifier son budget et voir son historique commercial.</p>
+              <Database size={64} className="text-slate-300 mb-4" />
+              {currentStatus === 'en_pause' ? (
+                <>
+                  <h3 className="font-bold text-slate-500 text-lg">Vous êtes actuellement en Pause ⏸️</h3>
+                  <p className="text-xs text-slate-400 mt-1 max-w-sm text-center">
+                    Vous ne pouvez pas consulter de dossier client pendant votre pause. 
+                    Veuillez repasser en statut <strong>Activité (En ligne)</strong> en haut de la page pour reprendre votre travail.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h3 className="font-bold text-slate-400 text-lg">Aucun dossier prospect sélectionné</h3>
+                  <p className="text-xs text-slate-300 mt-1 max-w-sm text-center">Cliquez sur l'un des leads dans l'onglet de gauche pour le qualification, qualifier son budget et voir son historique commercial.</p>
+                </>
+              )}
             </div>
           )}
         </div>
 
       </div>
+      ) : (
+        /* Mon Suivi de Présence & Pauses Section */
+        <div className="flex-1 max-w-7xl mx-auto w-full p-6 md:p-12 space-y-8 animate-in fade-in duration-300">
+          <header className="mb-2">
+            <h1 className="text-3xl font-extrabold text-slate-950 tracking-tight">Mon Suivi de Présence & Activité</h1>
+            <p className="text-slate-500 font-medium mt-1">Gérez votre état de présence, déclarez vos pauses et visualisez vos heures de service cumulées.</p>
+          </header>
+
+          {/* Real-time switcher details */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className={`p-6 rounded-3xl border ${
+              currentStatus === 'en_ligne' 
+                ? 'bg-emerald-50/40 border-emerald-100 shadow-sm shadow-emerald-100' 
+                : currentStatus === 'en_pause'
+                ? 'bg-amber-50/40 border-amber-100 shadow-sm shadow-amber-100'
+                : 'bg-slate-50/50 border-slate-100'
+            }`}>
+              <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Statut de Connexion Actuel</span>
+              <div className="flex items-center gap-2 mt-2">
+                <span className={`h-3 w-3 rounded-full ${
+                  currentStatus === 'en_ligne' ? 'bg-emerald-500 animate-pulse' : currentStatus === 'en_pause' ? 'bg-amber-500 animate-pulse' : 'bg-slate-400'
+                }`}></span>
+                <span className="text-lg font-black text-slate-900">
+                  {currentStatus === 'en_ligne' ? 'Activité (En ligne)' : currentStatus === 'en_pause' ? 'En Pause (Suspendu)' : 'Déconnecté / Invisible'}
+                </span>
+              </div>
+
+              {conn?.statusStartedAt && (
+                <p className="text-xs text-slate-400 mt-2 font-semibold">
+                  Depuis le {new Date(conn.statusStartedAt).toLocaleDateString()} à {new Date(conn.statusStartedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </p>
+              )}
+
+              {/* Status control buttons */}
+              <div className="mt-6 flex flex-col gap-2">
+                {currentStatus !== 'en_ligne' && (
+                  <button
+                    onClick={() => handleStatusChange('en_ligne')}
+                    className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition-all uppercase tracking-wider"
+                  >
+                    ▶️ Se mettre En ligne / Reprendre
+                  </button>
+                )}
+                {currentStatus === 'en_ligne' && (
+                  <button
+                    onClick={() => handleStatusChange('en_pause')}
+                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-450 active:scale-95 text-white font-extrabold text-xs rounded-xl shadow-md cursor-pointer transition-all uppercase tracking-wider"
+                  >
+                    ⏸️ Déclarer une Pause
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* My Performance Analytics */}
+            {(() => {
+              const myLogs = presenceLogs.filter(log => log.email.toLowerCase() === agent.email.toLowerCase());
+              
+              let activeMins = 0;
+              let breakMins = 0;
+              myLogs.forEach(l => {
+                const duration = l.durationMinutes || 0;
+                if (l.status === 'en_ligne') {
+                  activeMins += duration;
+                } else if (l.status === 'en_pause') {
+                  breakMins += duration;
+                }
+              });
+
+              const totalMins = activeMins + breakMins;
+              const breakRatio = totalMins > 0 ? Math.round((breakMins / totalMins) * 100) : 0;
+
+              const formatMinToHuman = (mins: number) => {
+                if (mins <= 0) return '0 min';
+                if (mins < 60) return `${mins} min`;
+                const hrs = Math.floor(mins / 60);
+                const rem = mins % 60;
+                return rem > 0 ? `${hrs}h ${rem}m` : `${hrs}h`;
+              };
+
+              return (
+                <div className="col-span-2 grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-3xs flex flex-col justify-between">
+                    <div>
+                      <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Mon Temps de Service</span>
+                      <h3 className="text-2xl font-black text-slate-900 mt-2">{formatMinToHuman(activeMins)}</h3>
+                    </div>
+                    <p className="text-[10px] text-slate-500 font-semibold mt-4">Durée cumulée en ligne (Activité)</p>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-3xs flex flex-col justify-between">
+                    <div>
+                      <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Mon Temps de Pause</span>
+                      <h3 className="text-2xl font-black text-slate-900 mt-2">{formatMinToHuman(breakMins)}</h3>
+                    </div>
+                    <p className="text-[10px] text-slate-500 font-semibold mt-4">Durée cumulée de pauses déclarées</p>
+                  </div>
+
+                  <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-3xs flex flex-col justify-between">
+                    <div>
+                      <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider font-semibold">Ratio Pause / Travail</span>
+                      <h3 className="text-2xl font-black text-indigo-600 mt-2">{breakRatio}%</h3>
+                    </div>
+                    <p className="text-[10px] text-slate-500 font-semibold mt-4">Taux de pause par rapport au temps total</p>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Historical Logs List */}
+          <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-4">
+            <div>
+              <h2 className="text-lg font-bold text-slate-900">Mon Historique d'Activité individuel</h2>
+              <p className="text-xs text-slate-400 font-semibold">Retrouvez toutes vos sessions de connexion, déconnexion et de pause avec leurs durées associées.</p>
+            </div>
+
+            <div className="overflow-x-auto border border-slate-100 rounded-2xl">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100">
+                    <th className="px-6 py-3.5">Action / Événement</th>
+                    <th className="px-6 py-3.5">Date & Heure de Début</th>
+                    <th className="px-6 py-3.5">Date & Heure de Fin</th>
+                    <th className="px-6 py-3.5">Durée Cumulée</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-semibold text-slate-700">
+                  {(() => {
+                    const myLogs = presenceLogs.filter(log => log.email.toLowerCase() === agent.email.toLowerCase());
+
+                    if (myLogs.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan={4} className="text-center py-8 text-slate-400 italic font-semibold">
+                            Aucun enregistrement d'activité pour le moment.
+                          </td>
+                        </tr>
+                      );
+                    }
+
+                    return myLogs.map((log) => (
+                      <tr key={log.id || log.startedAt} className="hover:bg-slate-50/50">
+                        <td className="px-6 py-3.5">
+                          {log.status === 'en_ligne' ? (
+                            <span className="bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-full text-[10px] font-black border border-emerald-100 flex items-center gap-1 w-fit">
+                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                              Activité En ligne
+                            </span>
+                          ) : log.status === 'en_pause' ? (
+                            <span className="bg-amber-50 text-amber-700 px-2.5 py-1 rounded-full text-[10px] font-black border border-amber-100 flex items-center gap-1 w-fit">
+                              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                              Pause Déclarée
+                            </span>
+                          ) : (
+                            <span className="bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full text-[10px] font-bold flex items-center gap-1 w-fit">
+                              <span className="h-1.5 w-1.5 rounded-full bg-slate-400"></span>
+                              Déconnexion
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-6 py-3.5 font-mono text-slate-600">
+                          {new Date(log.startedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                        </td>
+                        <td className="px-6 py-3.5 font-mono text-slate-600">
+                          {log.endedAt 
+                            ? new Date(log.endedAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) 
+                            : <span className="text-emerald-600 font-extrabold animate-pulse">Session active</span>
+                          }
+                        </td>
+                        <td className="px-6 py-3.5 font-mono font-bold text-slate-900">
+                          {log.endedAt ? (
+                            log.durationMinutes < 1 
+                              ? 'Moins d\'une minute' 
+                              : log.durationMinutes < 60
+                              ? `${log.durationMinutes} min`
+                              : `${Math.floor(log.durationMinutes / 60)}h ${log.durationMinutes % 60}m`
+                          ) : (
+                            <span className="text-emerald-600 font-extrabold animate-pulse">En cours</span>
+                          )}
+                        </td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Overdue/Planned Recall alert overlay */}
       <AnimatePresence>

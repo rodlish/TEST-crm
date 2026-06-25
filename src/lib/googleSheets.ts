@@ -26,6 +26,8 @@ export async function ensureSheetSchemaAndResize(accessToken: string, spreadshee
     const leadsSheet = sheets.find((s: any) => s.properties.title === 'Leads');
     const historySheet = sheets.find((s: any) => s.properties.title === 'Historique');
     const agentsSheet = sheets.find((s: any) => s.properties.title === 'Agents');
+    const presenceSheet = sheets.find((s: any) => s.properties.title === 'Présence_Agents');
+    const logsPresenceSheet = sheets.find((s: any) => s.properties.title === 'Logs_Présence');
 
     const requests: any[] = [];
 
@@ -119,6 +121,36 @@ export async function ensureSheetSchemaAndResize(accessToken: string, spreadshee
       });
     }
 
+    // Présence_Agents sheet adjustments
+    if (!presenceSheet) {
+      requests.push({
+        addSheet: {
+          properties: {
+            title: 'Présence_Agents',
+            gridProperties: {
+              frozenRowCount: 1,
+              columnCount: 10
+            }
+          }
+        }
+      });
+    }
+
+    // Logs_Présence sheet adjustments
+    if (!logsPresenceSheet) {
+      requests.push({
+        addSheet: {
+          properties: {
+            title: 'Logs_Présence',
+            gridProperties: {
+              frozenRowCount: 1,
+              columnCount: 10
+            }
+          }
+        }
+      });
+    }
+
     if (requests.length > 0) {
       const resizeRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
         method: 'POST',
@@ -191,6 +223,18 @@ export async function ensureSheetSchemaAndResize(accessToken: string, spreadshee
           range: 'Agents!A1:F1',
           values: [
             ['ID Agent', 'Nom Complet', 'Email', 'Mot de passe', 'Actif', 'Leads Assignés'],
+          ],
+        },
+        {
+          range: 'Présence_Agents!A1:F1',
+          values: [
+            ['Nom Complet', 'Email', 'Rôle', 'Statut Actuel', 'Début du Statut', 'Dernière Activité'],
+          ],
+        },
+        {
+          range: 'Logs_Présence!A1:H1',
+          values: [
+            ['ID Log', 'Nom Complet', 'Email', 'Rôle', 'Statut', 'Heure Début', 'Heure Fin', 'Durée (minutes)'],
           ],
         },
       ],
@@ -399,7 +443,9 @@ export async function pushCRMDataToSheet(
   accessToken: string,
   spreadsheetId: string,
   leads: Lead[],
-  agents?: AgentAccount[]
+  agents?: AgentAccount[],
+  activePresences?: any[],
+  presenceLogs?: any[]
 ): Promise<boolean> {
   try {
     // Dynamically check and resize/upgrade sheet columns and tabs to avoid API grid bounds errors
@@ -474,10 +520,38 @@ export async function pushCRMDataToSheet(
       agent.assignedLeadsCount || 0,
     ]);
 
+    // 4. Convert active connections (presence) to Rows
+    const presenceRows = (activePresences || []).map((p) => [
+      p.name || '',
+      p.email || '',
+      p.role === 'admin' ? 'Administrateur' : 'Conseiller',
+      p.status === 'en_ligne' ? 'En ligne' : p.status === 'en_pause' ? 'En pause' : 'Déconnecté',
+      p.statusStartedAt || '',
+      p.lastActive || '',
+    ]);
+
+    // 5. Convert presence logs to Rows
+    const logRows = (presenceLogs || []).map((l) => [
+      l.id || '',
+      l.name || '',
+      l.email || '',
+      l.role === 'admin' ? 'Administrateur' : 'Conseiller',
+      l.status === 'en_ligne' ? 'Activité' : l.status === 'en_pause' ? 'Pause' : 'Déconnexion',
+      l.startedAt || '',
+      l.endedAt || '',
+      l.durationMinutes || 0,
+    ]);
+
     // We overwrite the rest of sheets by writing from row 2
     // But we need to make sure we clear old data first to avoid overlapping with shorter arrays
     const clearBody = {
-      ranges: ['Leads!A2:AK10000', 'Historique!A2:G10000', 'Agents!A2:F10000'],
+      ranges: [
+        'Leads!A2:AK10000', 
+        'Historique!A2:G10000', 
+        'Agents!A2:F10000',
+        'Présence_Agents!A2:F10000',
+        'Logs_Présence!A2:H10000'
+      ],
     };
 
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
@@ -510,6 +584,20 @@ export async function pushCRMDataToSheet(
       updateData.push({
         range: `Agents!A2:F${agentRows.length + 1}`,
         values: agentRows,
+      });
+    }
+
+    if (presenceRows.length > 0) {
+      updateData.push({
+        range: `Présence_Agents!A2:F${presenceRows.length + 1}`,
+        values: presenceRows,
+      });
+    }
+
+    if (logRows.length > 0) {
+      updateData.push({
+        range: `Logs_Présence!A2:H${logRows.length + 1}`,
+        values: logRows,
       });
     }
 
